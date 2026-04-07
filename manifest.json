@@ -1,0 +1,79 @@
+{
+  "manifest_version": 3,
+  "name": "CG Suite Research",
+  "version": "1.0.0",
+  "description": "Capture listing data from eBay and Cash Converters for CG Suite research forms.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs",
+    "tabGroups"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*",
+    "https://nospos.com/*",
+    "https://*.nospos.com/*",
+    "https://www.ebay.co.uk/*",
+    "https://ebay.co.uk/*",
+    "https://www.cashconverters.co.uk/*",
+    "https://cashconverters.co.uk/*",
+    "https://uk.webuy.com/*",
+    "https://www.webuy.com/*",
+    "https://www.\u006d\u0061\u0073\u0074\u0065\u0072\u006d\u0065\u006c\u0074\u0067\u0072\u006f\u0075\u0070.com/*",
+    "https://\u006d\u0061\u0073\u0074\u0065\u0072\u006d\u0065\u006c\u0074\u0067\u0072\u006f\u0075\u0070.com/*",
+    "http://localhost/*",
+    "https://localhost/*",
+    "http://127.0.0.1/*",
+    "https://127.0.0.1/*",
+    "https://*.vercel.app/*",
+    "https://fonts.googleapis.com/*",
+    "https://fonts.gstatic.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost/*",
+        "https://localhost/*",
+        "http://127.0.0.1/*",
+        "https://127.0.0.1/*",
+        "https://*.vercel.app/*"
+      ],
+      "js": ["content-bridge.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://www.ebay.co.uk/*", "https://ebay.co.uk/*"],
+      "js": ["content-listings.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.cashconverters.co.uk/*", "https://cashconverters.co.uk/*"],
+      "js": ["content-listings.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://uk.webuy.com/*", "https://www.webuy.com/*"],
+      "js": [
+        "content-listings.js",
+        "cex-scrape/cex-nav-parser.js",
+        "cex-scrape/content-cex-nav-scrape.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://nospos.com/*", "https://*.nospos.com/*"],
+      "js": ["content-nospos.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://nospos.com/newagreement/*", "https://*.nospos.com/newagreement/*"],
+      "js": ["content-nospos-agreement-fill.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

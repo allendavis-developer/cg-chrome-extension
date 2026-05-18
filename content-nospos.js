@@ -12,16 +12,7 @@
  * 6. When done, background focuses app tab.
  */
 (function () {
-  function ensureCgSuiteInter() {
-    if (document.getElementById('cg-suite-font-inter')) return;
-    var link = document.createElement('link');
-    link.id = 'cg-suite-font-inter';
-    link.rel = 'stylesheet';
-    link.href =
-      'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap';
-    (document.head || document.documentElement).appendChild(link);
-  }
-  ensureCgSuiteInter();
+  CG_DOM_UTILS.ensureCgSuiteInter();
 
   const LOGIN_PATH_PATTERN = /^\/(login|signin|sign-in|auth|log-in|session|sessions|account\/login)(\/|$)/i;
   const LOGIN_SUBDOMAINS = ['login', 'auth', 'signin', 'sso', 'accounts'];
@@ -367,16 +358,16 @@
     panel.id = 'cg-suite-customer-panel';
     panel.innerHTML =
       '<div style="position:fixed;top:50%;right:0;transform:translateY(-50%);z-index:2147483647;' +
-        'background:#1e3a8a;color:white;padding:28px 32px;border-radius:18px 0 0 18px;' +
-        'box-shadow:-8px 8px 32px rgba(0,0,0,0.45);font-family:Inter,sans-serif;' +
-        'min-width:320px;max-width:400px;">' +
-        '<p style="margin:0 0 8px 0;font-weight:800;font-size:20px;">Customer Lookup</p>' +
-        '<p style="margin:0 0 20px 0;font-size:14px;opacity:0.85;line-height:1.5;">' +
+        'background:#1e3a8a;color:white;padding:18px 20px;border-radius:14px 0 0 14px;' +
+        'box-shadow:-8px 8px 28px rgba(0,0,0,0.42);font-family:Inter,sans-serif;' +
+        'width:240px;min-width:210px;max-width:380px;resize:horizontal;overflow:auto;box-sizing:border-box;">' +
+        '<p style="margin:0 0 6px 0;font-weight:800;font-size:17px;">Customer Lookup</p>' +
+        '<p style="margin:0 0 14px 0;font-size:13px;opacity:0.85;line-height:1.4;">' +
           'Search for the customer below. When you open their profile, we\'ll take it from there.' +
         '</p>' +
-        '<button id="cg-suite-customer-cancel" style="width:100%;padding:12px 20px;background:transparent;' +
+        '<button id="cg-suite-customer-cancel" style="width:100%;padding:10px 14px;background:transparent;' +
           'color:#e5e7eb;border:1px solid rgba(248,250,252,0.5);border-radius:9999px;' +
-          'font-weight:600;cursor:pointer;font-size:15px;">Cancel</button>' +
+          'font-weight:600;cursor:pointer;font-size:13px;">Cancel</button>' +
       '</div>';
     document.body.appendChild(panel);
 
@@ -1393,15 +1384,40 @@
       return;
     }
 
+    var currentStockName = (function () {
+      var el = document.getElementById('stock-name');
+      return el ? (el.value || '').trim() : '';
+    })();
+    var currentExternallyListed = (function () {
+      var el = document.querySelector('#stock-externally_listed_at[type="checkbox"]');
+      return !!(el && el.checked);
+    })();
+
     chrome.runtime.sendMessage({
       type: 'NOSPOS_STOCK_EDIT_READY',
       oldRetailPrice: getRetailPriceFromPage(),
+      currentStockName: currentStockName,
+      currentExternallyListed: currentExternallyListed,
       stockBarcode
     }, function (response) {
-      if (response?.ok && response.salePrice !== undefined) {
-        fillRetailPriceInput(response.salePrice);
-        setTimeout(function () { clickSaveButton(); }, 150);
+      if (!response?.ok) return;
+      // Set item name unconditionally (mirrors Web EPOS approach)
+      if (response.stockName) {
+        var nameEl = document.getElementById('stock-name');
+        if (nameEl) {
+          nameEl.value = response.stockName;
+          nameEl.dispatchEvent(new Event('input', { bubbles: true }));
+          nameEl.dispatchEvent(new Event('change', { bubbles: true }));
+        }
       }
+      // Tick externally listed for every item
+      var extEl = document.querySelector('#stock-externally_listed_at[type="checkbox"]');
+      if (extEl && !extEl.checked) {
+        extEl.checked = true;
+        extEl.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      if (response.salePrice !== undefined) fillRetailPriceInput(response.salePrice);
+      setTimeout(function () { clickSaveButton(); }, 150);
     });
   }
 

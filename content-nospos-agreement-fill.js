@@ -3,6 +3,8 @@
  */
 (function () {
   const NS = '[CG Suite NosPos fill]';
+  /** Small safety pause before high-impact Actions menu clicks (park/delete) to avoid server rate limiting. */
+  const NOSPOS_ACTION_CLICK_DELAY_MS = 1200;
 
   function log() {
     const args = Array.prototype.slice.call(arguments);
@@ -14,6 +16,25 @@
     const args = Array.prototype.slice.call(arguments);
     args.unshift(NS);
     console.warn.apply(console, args);
+  }
+
+  /**
+   * Forward a log entry to the background service worker so it is captured in cgParkLog.
+   * Fire-and-forget — never blocks content script execution.
+   */
+  function logToBackground(fn, phase, data, msg) {
+    try {
+      let safe = {};
+      try {
+        safe = JSON.parse(JSON.stringify(data ?? {}, (_k, v) => {
+          if (v === undefined) return null;
+          if (typeof v === 'function') return '[Function]';
+          if (v instanceof Element) return `[Element: ${v.tagName}${v.id ? '#' + v.id : ''}]`;
+          return v;
+        }));
+      } catch (_) {}
+      chrome.runtime.sendMessage({ type: 'PARK_LOG_ENTRY', fn, phase, data: safe, msg: msg || '' }).catch(() => {});
+    } catch (_) {}
   }
 
   function normLabel(s) {
@@ -647,9 +668,16 @@
   function runCategoryPhase(categoryId, lineIndex) {
     const lineIdx = Math.max(0, parseInt(String(lineIndex ?? '0'), 10) || 0);
     log('phase category', categoryId, 'line', lineIdx);
+    logToBackground('runCategoryPhase', 'enter', { categoryId, lineIndex: lineIdx, url: window.location.href }, `Setting category ${categoryId} on line ${lineIdx}`);
     const sel = nthItemCategorySelect(lineIdx);
-    if (!sel) return { ok: false, error: 'Category field not found for line ' + lineIdx };
-    return setCategorySelect(sel, categoryId);
+    if (!sel) {
+      logToBackground('runCategoryPhase', 'error', { lineIndex: lineIdx, totalSelects: listCategorySelects().length }, 'Category select not found for line');
+      return { ok: false, error: 'Category field not found for line ' + lineIdx };
+    }
+    logToBackground('runCategoryPhase', 'step', { lineIndex: lineIdx, currentValue: sel.value, wantedCategoryId: categoryId }, 'Category select found — setting value');
+    const result = setCategorySelect(sel, categoryId);
+    logToBackground('runCategoryPhase', 'exit', { result, lineIndex: lineIdx, categoryId }, 'setCategorySelect result');
+    return result;
   }
 
   function runFindLineMarker(marker) {
@@ -717,6 +745,7 @@
     const selectors = [
       '.swal2-confirm',
       'button.swal2-confirm',
+      '.swal2-actions button.swal2-confirm',
       '.swal-button--confirm',
       '[data-bb-handler="confirm"]',
       '.bootbox .btn-primary',
@@ -786,32 +815,58 @@
   }
 
   async function runSidebarParkAgreement() {
+    logToBackground('runSidebarParkAgreement', 'enter', { url: window.location.href }, 'Content script: beginning sidebar park agreement');
     let parkLink = findSidebarAgreementParkLink();
     const card = parkLink ? parkLink.closest('.card') : null;
+    logToBackground('runSidebarParkAgreement', 'step', {
+      parkLinkFound: !!parkLink,
+      parkLinkHref: parkLink ? parkLink.getAttribute('href') : null,
+      cardFound: !!card,
+    }, 'Initial search for park link and agreement card');
     if (!card) {
       warn('sidebar park: agreement summary card / park link not found');
+      logToBackground('runSidebarParkAgreement', 'error', { url: window.location.href }, 'Agreement card / park link not found in DOM');
       return { ok: false, error: 'Park Agreement was not found (Agreement card → Actions)' };
     }
+    logToBackground('runSidebarParkAgreement', 'step', {}, 'Opening Actions dropdown in agreement card');
     openActionsDropdownInCard(card);
     await new Promise((r) => setTimeout(r, 280));
     parkLink = findSidebarAgreementParkLink();
+    logToBackground('runSidebarParkAgreement', 'step', { parkLinkFound: !!parkLink, parkLinkHref: parkLink?.getAttribute('href') }, 'Park link search after 1st Actions open');
     if (!parkLink) {
+      logToBackground('runSidebarParkAgreement', 'step', {}, 'Park link not found — retrying Actions open');
       openActionsDropdownInCard(card);
       await new Promise((r) => setTimeout(r, 280));
       parkLink = findSidebarAgreementParkLink();
+      logToBackground('runSidebarParkAgreement', 'step', { parkLinkFound: !!parkLink, parkLinkHref: parkLink?.getAttribute('href') }, 'Park link search after 2nd Actions open');
     }
     if (!parkLink) {
+      logToBackground('runSidebarParkAgreement', 'error', {}, 'Park Agreement link still missing after both Actions attempts');
       return { ok: false, error: 'Park Agreement link missing after opening Actions' };
     }
-    log('sidebar park — click POST link', parkLink.getAttribute('href'));
+    const parkHref = parkLink.getAttribute('href');
+    log('sidebar park — click POST link', parkHref);
+    logToBackground(
+      'runSidebarParkAgreement',
+      'step',
+      { delayMs: NOSPOS_ACTION_CLICK_DELAY_MS, parkHref },
+      'Rate-limit guard: delaying before Park Agreement click'
+    );
+    await new Promise((r) => setTimeout(r, NOSPOS_ACTION_CLICK_DELAY_MS));
+    logToBackground('runSidebarParkAgreement', 'step', { parkHref }, 'Clicking Park Agreement POST link');
     parkLink.click();
-    const conf = await confirmDeleteDialogIfPresent(15000);
+    logToBackground('runSidebarParkAgreement', 'step', {}, 'Park link clicked — waiting for confirmation dialog (up to 45s)');
+    // Park dialogs can be slower than delete confirms; allow time for manual/extension OK.
+    const conf = await confirmDeleteDialogIfPresent(45000);
+    logToBackground('runSidebarParkAgreement', 'result', { confirmed: conf.confirmed }, 'Confirmation dialog result');
     if (!conf.confirmed) {
+      logToBackground('runSidebarParkAgreement', 'error', {}, 'OK confirmation dialog did not appear');
       return {
         ok: false,
         error: 'Parking confirmation (OK) did not appear — confirm manually on NoSpos',
       };
     }
+    logToBackground('runSidebarParkAgreement', 'exit', { parked: true }, 'Park agreement confirmed via dialog — done');
     return { ok: true, parked: true };
   }
 
@@ -875,12 +930,15 @@
 
   function runRestPhase(msg) {
     const lineIdx = Math.max(0, parseInt(String(msg.lineIndex ?? '0'), 10) || 0);
+    logToBackground('runRestPhase', 'enter', {
+      lineIndex: lineIdx, name: msg.name, quantity: msg.quantity,
+      retailPrice: msg.retailPrice, boughtFor: msg.boughtFor,
+      stockFieldCount: Array.isArray(msg.stockFields) ? msg.stockFields.length : 0,
+      itemDescription: msg.itemDescription,
+    }, `Filling rest of line ${lineIdx}`);
     log('phase rest start', {
-      lineIndex: lineIdx,
-      name: msg.name,
-      quantity: msg.quantity,
-      retailPrice: msg.retailPrice,
-      boughtFor: msg.boughtFor,
+      lineIndex: lineIdx, name: msg.name, quantity: msg.quantity,
+      retailPrice: msg.retailPrice, boughtFor: msg.boughtFor,
       stockCount: Array.isArray(msg.stockFields) ? msg.stockFields.length : 0,
     });
     const root = scopeRootForLineIndex(lineIdx);
@@ -1060,6 +1118,7 @@
 
     const missingRequired = Array.from(new Set(listMissingRequiredInRoot(root)));
 
+    logToBackground('runRestPhase', 'exit', { lineIndex: lineIdx, applied, warnings, missingRequired, fieldRowsLen: fieldRows.length }, 'Rest phase complete');
     log('phase rest done', { applied, warnings, missingRequired, fieldRowsLen: fieldRows.length });
     return {
       ok: true,

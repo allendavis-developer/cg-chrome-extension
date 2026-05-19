@@ -414,6 +414,75 @@
     return m ? m[1] : null;
   }
 
+  // NoSpos serves the photo as a session-protected, relative URL
+  // (e.g. /protected-file/view?id=8310). The web app is a different origin
+  // with no NoSpos session, so it can never load that URL. The browser HAS
+  // already loaded that image on this page, so the reliable extraction is to
+  // draw a freshly loaded <img> (same-origin → canvas not tainted) and export
+  // base64. A credentialed fetch is kept as a fallback.
+  function profilePictureToDataUrl(rawUrl) {
+    return new Promise(function (resolve) {
+      function done(result) { resolve(result || null); }
+      try {
+        if (!rawUrl) { done(null); return; }
+        if (/^data:/i.test(rawUrl)) { done(rawUrl); return; }
+        var absUrl = new URL(rawUrl, location.origin).href;
+
+        // ── Method 1: canvas from a freshly loaded Image (uses HTTP cache +
+        //    session cookies the same way the visible photo did). ──────────
+        function tryCanvas(next) {
+          try {
+            var img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = function () {
+              try {
+                if (!img.naturalWidth || !img.naturalHeight) { next(); return; }
+                var canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+                canvas.getContext('2d').drawImage(img, 0, 0);
+                var url = canvas.toDataURL('image/jpeg', 0.9);
+                if (url && url.length > 'data:image/jpeg;base64,'.length + 8) {
+                  done(url);
+                } else {
+                  next();
+                }
+              } catch (e) { next(); }
+            };
+            img.onerror = function () { next(); };
+            img.src = absUrl;
+          } catch (e) { next(); }
+        }
+
+        // ── Method 2: credentialed fetch → blob → base64. ─────────────────
+        function tryFetch() {
+          fetch(absUrl, { credentials: 'include' })
+            .then(function (res) {
+              if (!res.ok) throw new Error('HTTP ' + res.status);
+              return res.blob();
+            })
+            .then(function (blob) {
+              if (!blob || blob.size === 0 || blob.size > 3 * 1024 * 1024) {
+                done(null);
+                return;
+              }
+              var reader = new FileReader();
+              reader.onloadend = function () {
+                done(typeof reader.result === 'string' ? reader.result : null);
+              };
+              reader.onerror = function () { done(null); };
+              reader.readAsDataURL(blob);
+            })
+            .catch(function () { done(null); });
+        }
+
+        tryCanvas(function () { tryFetch(); });
+      } catch (e) {
+        done(null);
+      }
+    });
+  }
+
   function scrapeCustomerStats() {
     var stats = {};
     var details = document.querySelectorAll('.card-content .detail-view .detail');
@@ -1066,6 +1135,21 @@
     }
 
     function _doProceedWithCustomerData(bypassReason) {
+      // The scraped photo is a session-protected relative NoSpos URL the web
+      // app can't load. Embed it as a base64 data URL here (we have the NoSpos
+      // session), then re-enter so all downstream send paths get the inlined
+      // image. Race-safe: clicks while the fetch is pending just wait.
+      if (d && d.profilePicture && !/^data:/i.test(d.profilePicture)) {
+        if (!d._photoEmbedStarted) {
+          d._photoEmbedStarted = true;
+          profilePictureToDataUrl(d.profilePicture).then(function (embedded) {
+            d.profilePicture = embedded || null;
+            _doProceedWithCustomerData(bypassReason);
+          });
+        }
+        return;
+      }
+
       var enteredPhone   = getFieldVal('cg-field-mobile');
       var enteredEmail   = getFieldVal('cg-field-email');
       var enteredPost    = getFieldVal('cg-field-postcode');
@@ -1135,6 +1219,7 @@
 
       var customer = {
         nosposCustomerId: extractNosposCustomerIdFromPath(),
+        profilePicture: d.profilePicture,
         forename:       finalForename,
         surname:        finalSurname,
         dob:            finalDob,
@@ -1301,13 +1386,16 @@
         customer.name    = (customer.forename + ' ' + customer.surname).trim();
         customer.phone   = customer.mobile || customer.homePhone;
         customer.address = [customer.address1, customer.address2, customer.town, customer.county, customer.postcode].filter(Boolean).join(', ');
-        chrome.runtime.sendMessage({
-          type: 'NOSPOS_CUSTOMER_DONE',
-          requestId: townFixPending.requestId,
-          cancelled: false,
-          customer: customer,
-          changes: [{ field: 'Town', from: '', to: currentTown }]
-        }).catch(function () {});
+        profilePictureToDataUrl(customer.profilePicture).then(function (embedded) {
+          customer.profilePicture = embedded || null;
+          chrome.runtime.sendMessage({
+            type: 'NOSPOS_CUSTOMER_DONE',
+            requestId: townFixPending.requestId,
+            cancelled: false,
+            customer: customer,
+            changes: [{ field: 'Town', from: '', to: currentTown }]
+          }).catch(function () {});
+        });
         return;
       }
       // Town still empty — fall through to show the modal again

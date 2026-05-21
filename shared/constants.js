@@ -48,4 +48,23 @@ var CG_MSG = {
   JEWELLERY_SCRAP_PRICES_SCRAPED: 'JEWELLERY_SCRAP_PRICES_SCRAPED',
   JEWELLERY_SCRAP_PRICES_TO_CONTENT: 'JEWELLERY_SCRAP_PRICES_TO_CONTENT',
   JEWELLERY_SCRAP_PRICES: 'JEWELLERY_SCRAP_PRICES',
+
+  // Handshake the content-bridge announces to the page so Cash EPOS can
+  // detect the extension's protocol version (see CG_EXT_PROTOCOL_VERSION).
+  CG_EXT_HELLO: 'CG_EXT_HELLO',
 };
+
+/**
+ * Integer protocol version for the Cash EPOS ↔ extension contract.
+ *
+ * BUMP this whenever you change a message shape, add/remove a required bridge
+ * action, or otherwise make the extension incompatible with an older Cash
+ * EPOS deployment (or vice-versa). The Django side carries the matching
+ * MIN_EXTENSION_PROTOCOL_VERSION constant in pricing/version.py — when the
+ * two diverge, Cash EPOS will lock the operational modules and show the
+ * "extension out of sync" banner until the operator reinstalls.
+ *
+ * The marketing version in manifest.json moves independently (semver-ish for
+ * users); this integer is the only thing the runtime compares against.
+ */
+var CG_EXT_PROTOCOL_VERSION = 1;

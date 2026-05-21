@@ -19,6 +19,7 @@
 
 importScripts(
   // 1. Shared constants + state maps.
+  'shared/constants.js',
   'bootstrap/constants.js',
 
   // 2. SDK primitives (no flow deps).
@@ -66,6 +67,7 @@ importScripts(
   'flows/bridge/actions/fill-nospos-park-agreement-category.js',
   'flows/bridge/actions/fill-nospos-park-agreement-rest.js',
   'flows/bridge/actions/focus-or-open-nospos-park-tab.js',
+  'flows/bridge/actions/get-extension-status.js',
   'flows/bridge/actions/get-last-repricing-result.js',
   'flows/bridge/actions/get-nospos-repricing-status.js',
   'flows/bridge/actions/get-nospos-tab-url.js',

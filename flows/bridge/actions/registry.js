@@ -62,6 +62,7 @@ const BRIDGE_ACTIONS = {
   scrapeWebeposCategoryHierarchy: handleBridgeAction_scrapeWebeposCategoryHierarchy,
   closeTabs: handleBridgeAction_closeTabs,
   openNosposAndWait: handleBridgeAction_openNosposAndWait,
+  getExtensionStatus: handleBridgeAction_getExtensionStatus,
   getLastRepricingResult: handleBridgeAction_getLastRepricingResult,
   clearLastRepricingResult: handleBridgeAction_clearLastRepricingResult,
   getNosposRepricingStatus: handleBridgeAction_getNosposRepricingStatus,

@@ -23,6 +23,39 @@
     }
   };
 
+  // Announce ourselves so Cash EPOS can detect (a) that the extension is
+  // installed and (b) whether its protocol version still matches what the
+  // backend expects. Re-announced on every page injection because the React
+  // SPA may load before this content script runs and miss the message.
+  function announceHello() {
+    try {
+      const manifestVersion =
+        chrome.runtime && chrome.runtime.getManifest
+          ? chrome.runtime.getManifest().version || null
+          : null;
+      const protocolVersion =
+        typeof CG_EXT_PROTOCOL_VERSION === 'number' ? CG_EXT_PROTOCOL_VERSION : 1;
+      window.postMessage(
+        {
+          source: 'cg-suite-ext',
+          type: 'CG_EXT_HELLO',
+          protocolVersion,
+          manifestVersion,
+        },
+        '*'
+      );
+    } catch (e) {
+      /* manifest may be unavailable in some MV3 edge cases; safe to ignore */
+    }
+  }
+  // Announce on load and again on DOM ready, so a SPA that mounts its
+  // listener slightly after page load still picks the message up. The
+  // app also re-asks on demand via the `getExtensionStatus` bridge action.
+  announceHello();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', announceHello, { once: true });
+  }
+
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'EXTENSION_PROGRESS_TO_PAGE') {
       window.postMessage(

@@ -593,28 +593,107 @@
     return changes;
   }
 
+  // Selectors for the editable fields we diff. Order is irrelevant — keyed by `key`.
+  var CUSTOMER_FORM_FIELDS = [
+    { key: 'forename',       sel: '#customer-forename',            type: 'text'   },
+    { key: 'surname',        sel: '#customer-surname',             type: 'text'   },
+    { key: 'postcode',       sel: '#customer-postcode',            type: 'text'   },
+    { key: 'address1',       sel: '#customer-address1',            type: 'text'   },
+    { key: 'address2',       sel: '#customer-address2',            type: 'text'   },
+    { key: 'town',           sel: '#customer-address3',            type: 'text'   },
+    { key: 'county',         sel: '#customer-address4',            type: 'text'   },
+    { key: 'mobile',         sel: '#customer-mobile',              type: 'text'   },
+    { key: 'homePhone',      sel: '#customer-home_phone',          type: 'text'   },
+    { key: 'email',          sel: '#customer-email',               type: 'text'   },
+    { key: 'dob',            sel: '#customer-dob',                 type: 'text'   },
+    { key: 'gender',         sel: '#customer-gender',              type: 'select' },
+    { key: 'emailMarketing', sel: '#customer-email_marketing_ok',  type: 'check'  },
+    { key: 'smsMarketing',   sel: '#customer-sms_marketing_ok',    type: 'check'  },
+    { key: 'mailMarketing',  sel: '#customer-direct_mail_ok',      type: 'check'  },
+  ];
+
   function scrapeCustomerForm() {
     function val(sel) { var el = document.querySelector(sel); return el ? (el.value || '').trim() : ''; }
     function isChecked(sel) { var el = document.querySelector(sel); return !!(el && el.checked); }
     var stats = scrapeCustomerStats();
-    return Object.assign({
-      profilePicture: scrapeProfilePicture(),
-      forename:       val('#customer-forename'),
-      surname:        val('#customer-surname'),
-      postcode:       val('#customer-postcode'),
-      address1:       val('#customer-address1'),
-      address2:       val('#customer-address2'),
-      town:           val('#customer-address3'),
-      county:         val('#customer-address4'),
-      mobile:         val('#customer-mobile'),
-      homePhone:      val('#customer-home_phone'),
-      email:          val('#customer-email'),
-      dob:            val('#customer-dob'),
-      gender:         val('#customer-gender'),
-      emailMarketing: isChecked('#customer-email_marketing_ok'),
-      smsMarketing:   isChecked('#customer-sms_marketing_ok'),
-      mailMarketing:  isChecked('#customer-direct_mail_ok'),
-    }, stats);
+    var out = { profilePicture: scrapeProfilePicture() };
+    CUSTOMER_FORM_FIELDS.forEach(function (f) {
+      out[f.key] = f.type === 'check' ? isChecked(f.sel) : val(f.sel);
+    });
+    return Object.assign(out, stats);
+  }
+
+  // Read the SERVER-RENDERED values of the editable fields from the HTML
+  // attributes (defaultValue/defaultChecked/defaultSelected) rather than the
+  // live .value/.checked. This is the snapshot of whatever NoSpos's database
+  // currently holds — which means it shifts every time NoSpos saves and
+  // re-renders the page. We use it for:
+  //   1. The diff baseline on FIRST entry, then persist it via
+  //      [[readCustomerOriginal/writeCustomerOriginal]] so the baseline stays
+  //      the pre-edit original even after a NoSpos save+reload.
+  //   2. Detecting "form is already saved" at Done time (current .value ==
+  //      defaultValue means the user's edits are already in NoSpos's DB).
+  // Returns only the keys CUSTOMER_FORM_FIELDS covers — the diff doesn't use
+  // anything else.
+  function scrapeCustomerFormOriginals() {
+    function defText(sel) {
+      var el = document.querySelector(sel);
+      return el ? (el.defaultValue || '').trim() : '';
+    }
+    function defCheck(sel) {
+      var el = document.querySelector(sel);
+      return !!(el && el.defaultChecked);
+    }
+    function defSelect(sel) {
+      var el = document.querySelector(sel);
+      if (!el) return '';
+      var opts = el.options || [];
+      for (var i = 0; i < opts.length; i++) {
+        if (opts[i].defaultSelected) return (opts[i].value || '').trim();
+      }
+      // No option carries the `selected` attribute → the browser implicitly
+      // selects the first one, so mirror that.
+      return opts.length > 0 ? (opts[0].value || '').trim() : '';
+    }
+    var out = {};
+    CUSTOMER_FORM_FIELDS.forEach(function (f) {
+      if (f.type === 'check')  out[f.key] = defCheck(f.sel);
+      else if (f.type === 'select') out[f.key] = defSelect(f.sel);
+      else out[f.key] = defText(f.sel);
+    });
+    return out;
+  }
+
+  // Persisted diff baseline. Captured the FIRST time we land on a customer
+  // detail page and held in sessionStorage so that — if the user presses
+  // NoSpos's own Save before our Done button, and the page reloads with
+  // post-save values rendered in the HTML — we still diff against the
+  // pre-edit original when they finally click Done.
+  // Keyed by NoSpos customer id so navigating between customers doesn't
+  // contaminate the baseline.
+  var CG_CUSTOMER_ORIGINAL_KEY = 'cgCustomerOriginal';
+
+  function readCustomerOriginal() {
+    try {
+      var raw = sessionStorage.getItem(CG_CUSTOMER_ORIGINAL_KEY);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      return parsed;
+    } catch (e) { return null; }
+  }
+
+  function writeCustomerOriginal(customerId, originals) {
+    try {
+      sessionStorage.setItem(
+        CG_CUSTOMER_ORIGINAL_KEY,
+        JSON.stringify({ customerId: customerId, originals: originals })
+      );
+    } catch (e) {}
+  }
+
+  function clearCustomerOriginal() {
+    try { sessionStorage.removeItem(CG_CUSTOMER_ORIGINAL_KEY); } catch (e) {}
   }
 
   function updateNosposField(selector, value) {
@@ -646,9 +725,24 @@
     var searchPanel = document.getElementById('cg-suite-customer-panel');
     if (searchPanel) searchPanel.remove();
 
-    // Snapshot the form BEFORE the user does anything. Used to compute the
-    // diff at Done time.
-    var snapshot = scrapeCustomerForm();
+    // Diff baseline. On FIRST entry we read the server-rendered values from
+    // the HTML attributes and persist them. On subsequent entries (same
+    // customer, e.g. after the user pressed NoSpos's own Save and the page
+    // re-rendered) we reuse the persisted original — otherwise the baseline
+    // would shift to post-save values and the diff would always be empty.
+    var customerIdForPanel = extractNosposCustomerIdFromPath();
+    var persistedOriginal = readCustomerOriginal();
+    var snapshot;
+    if (
+      persistedOriginal &&
+      persistedOriginal.customerId === customerIdForPanel &&
+      persistedOriginal.originals
+    ) {
+      snapshot = persistedOriginal.originals;
+    } else {
+      snapshot = scrapeCustomerFormOriginals();
+      writeCustomerOriginal(customerIdForPanel, snapshot);
+    }
 
     var panel = document.createElement('div');
     panel.id = 'cg-suite-customer-edit-panel';
@@ -764,6 +858,19 @@
       var changes = diffSnapshot(snapshot, after);
       var customer = buildCustomerPayload(after, changes);
 
+      // Shortcut: if the live form already matches NoSpos's saved baseline
+      // (`.value === defaultValue` for every diff field) the user already
+      // pressed NoSpos's own Save before clicking Done. Skip the redundant
+      // save round-trip — just send the diff (vs the persisted ORIGINAL)
+      // straight back to Cash EPOS.
+      var alreadySaved = diffSnapshot(scrapeCustomerFormOriginals(), after).length === 0;
+      if (alreadySaved) {
+        finalizeAndSend(customer, changes, {});
+        clearCustomerOriginal();
+        panel.remove();
+        return;
+      }
+
       var saveBtn = findSaveButton();
       if (!saveBtn) {
         // No save button → send what we have without saving
@@ -771,6 +878,7 @@
           sessionStorage.setItem('cgCustomerPending', JSON.stringify({ requestId: requestId, customer: customer, changes: changes }));
         } catch (e) {}
         finalizeAndSend(customer, changes, {});
+        clearCustomerOriginal();
         panel.remove();
         return;
       }
@@ -799,6 +907,7 @@
         if (pending && pending.requestId) {
           finalizeAndSend(pending.customer, pending.changes || [], { saveFailed: true });
         }
+        clearCustomerOriginal();
         panel.remove();
         showSaveFailedPanel(errorMsg);
       }
@@ -821,6 +930,7 @@
 
     cancelBtn.addEventListener('click', function () {
       chrome.runtime.sendMessage({ type: 'NOSPOS_CUSTOMER_DONE', requestId: requestId, cancelled: true }).catch(function () {});
+      clearCustomerOriginal();
       panel.remove();
     });
   }
@@ -884,6 +994,7 @@
           changes: pending.changes || []
         }).catch(function () {});
       });
+      clearCustomerOriginal();
       return;
     }
 

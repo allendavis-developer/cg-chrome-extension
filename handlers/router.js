@@ -114,6 +114,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'NOSPOS_CUSTOMER_CREATE_READY') {
+    handleNosposCustomerCreateReady(message, sender)
+      .then(r => sendResponse(r || { ok: false }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
   if (message.type === 'NOSPOS_CUSTOMER_DETAIL_READY') {
     handleNosposCustomerDetailReady(message, sender)
       .then(r => sendResponse(r || { ok: false }))

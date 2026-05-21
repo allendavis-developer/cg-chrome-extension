@@ -43,6 +43,7 @@ const BRIDGE_ACTIONS = {
   patchNosposAgreementField: handleBridgeAction_patchNosposAgreementField,
   fillNosposAgreementFirstItemCategory: handleBridgeAction_fillNosposAgreementFirstItemCategory,
   openNosposForCustomerIntake: handleBridgeAction_openNosposForCustomerIntake,
+  openNosposForNewCustomer: handleBridgeAction_openNosposForNewCustomer,
   openNosposSiteOnly: handleBridgeAction_openNosposSiteOnly,
   openNosposSiteForFields: handleBridgeAction_openNosposSiteForFields,
   openNosposSiteForCategoryFields: handleBridgeAction_openNosposSiteForCategoryFields,

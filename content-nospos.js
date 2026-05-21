@@ -19,7 +19,8 @@
   const STOCK_SEARCH_PAGE = '/stock/search';
   const STOCK_SEARCH_PAGE_PATTERN = /^\/stock\/search(?:\/index)?\/?$/i;
   const STOCK_EDIT_PAGE_PATTERN = /^\/stock\/\d+\/edit\/?$/i;
-  const CUSTOMER_SEARCH_PAGE_PATTERN = /^\/customers(?:\/|\?|$)/i;
+  const CUSTOMER_SEARCH_PAGE_PATTERN = /^\/customers\/?($|\?)/i;
+  const CUSTOMER_CREATE_PAGE_PATTERN = /^\/customers\/create\/?($|\?)/i;
   const CUSTOMER_DETAIL_PAGE_PATTERN = /^\/customer\/\d+\/(?:view|buying)\/?/i;
   const STOCK_CATEGORY_INDEX_PATTERN = /^\/stock\/category\/index\/?$/i;
   const STOCK_CATEGORY_MODIFY_PATTERN = /^\/stock\/category\/modify\/?$/i;
@@ -79,6 +80,14 @@
   function isOnCustomerSearchPage() {
     try {
       return CUSTOMER_SEARCH_PAGE_PATTERN.test(window.location.pathname || '/');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function isOnCustomerCreatePage() {
+    try {
+      return CUSTOMER_CREATE_PAGE_PATTERN.test(window.location.pathname || '/');
     } catch (e) {
       return false;
     }
@@ -300,6 +309,7 @@
     if (!isOnNosposDomain()) return;
     if (isOnLoginPage()) return;
     if (isOnCustomerSearchPage()) return;  // has its own flow
+    if (isOnCustomerCreatePage()) return;  // has its own flow
     if (isOnCustomerDetailPage()) return;  // has its own flow
 
     chrome.runtime.sendMessage({ type: 'NOSPOS_PAGE_READY' }).catch(function () {});
@@ -384,6 +394,45 @@
     chrome.runtime.sendMessage({ type: 'NOSPOS_CUSTOMER_SEARCH_READY' }, function (response) {
       if (response && response.ok && response.requestId) {
         showCustomerSearchPanel(response.requestId);
+      }
+    });
+  }
+
+  // ── Customer Create Panel (shown on /customers/create) ─────────────────────
+
+  function showCustomerCreatePanel(requestId) {
+    if (document.getElementById('cg-suite-customer-create-panel')) return;
+
+    var panel = document.createElement('div');
+    panel.id = 'cg-suite-customer-create-panel';
+    panel.innerHTML =
+      '<div style="position:fixed;top:50%;right:0;transform:translateY(-50%);z-index:2147483647;' +
+        'background:#1e3a8a;color:white;padding:18px 20px;border-radius:14px 0 0 14px;' +
+        'box-shadow:-8px 8px 28px rgba(0,0,0,0.42);font-family:Inter,sans-serif;' +
+        'width:260px;min-width:230px;max-width:380px;resize:horizontal;overflow:auto;box-sizing:border-box;">' +
+        '<p style="margin:0 0 6px 0;font-weight:800;font-size:17px;">Create new customer</p>' +
+        '<p style="margin:0 0 14px 0;font-size:13px;opacity:0.85;line-height:1.4;">' +
+          'Please type in at minimum their name. You can fill in the rest later. When you press Create, NoSpos will save the customer and we\'ll bring you to their profile.' +
+        '</p>' +
+        '<button id="cg-suite-customer-create-cancel" style="width:100%;padding:10px 14px;background:transparent;' +
+          'color:#e5e7eb;border:1px solid rgba(248,250,252,0.5);border-radius:9999px;' +
+          'font-weight:600;cursor:pointer;font-size:13px;">Cancel</button>' +
+      '</div>';
+    document.body.appendChild(panel);
+
+    var cancelBtn = document.getElementById('cg-suite-customer-create-cancel');
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        chrome.runtime.sendMessage({ type: 'NOSPOS_CUSTOMER_DONE', requestId: requestId, cancelled: true }).catch(function () {});
+        panel.remove();
+      });
+    }
+  }
+
+  function onCustomerCreatePageLoad() {
+    chrome.runtime.sendMessage({ type: 'NOSPOS_CUSTOMER_CREATE_READY' }, function (response) {
+      if (response && response.ok && response.requestId) {
+        showCustomerCreatePanel(response.requestId);
       }
     });
   }
@@ -585,32 +634,204 @@
     if (btn) btn.click();
   }
 
-  // ── field builders ────────────────────────────────────────────────────────
+  // ── Customer Edit Side Panel (shown on /customer/{id}/view) ────────────────
+  //
+  // Replaces the old full-screen modal. Non-intrusive side panel: the user
+  // edits the NoSpos form natively, then clicks "Done" to have us click Save
+  // and capture the field-level diff before returning to the Cash EPOS tab.
+
+  function showCustomerEditPanel(requestId) {
+    if (document.getElementById('cg-suite-customer-edit-panel')) return;
+
+    var searchPanel = document.getElementById('cg-suite-customer-panel');
+    if (searchPanel) searchPanel.remove();
+
+    // Snapshot the form BEFORE the user does anything. Used to compute the
+    // diff at Done time.
+    var snapshot = scrapeCustomerForm();
+
+    var panel = document.createElement('div');
+    panel.id = 'cg-suite-customer-edit-panel';
+    panel.innerHTML =
+      '<div style="position:fixed;top:50%;right:0;transform:translateY(-50%);z-index:2147483647;' +
+        'background:#1e3a8a;color:white;padding:18px 20px;border-radius:14px 0 0 14px;' +
+        'box-shadow:-8px 8px 28px rgba(0,0,0,0.42);font-family:Inter,sans-serif;' +
+        'width:260px;min-width:230px;max-width:380px;resize:horizontal;overflow:auto;box-sizing:border-box;">' +
+        '<p style="margin:0 0 6px 0;font-weight:800;font-size:17px;">Please update user information</p>' +
+        '<p style="margin:0 0 14px 0;font-size:13px;opacity:0.85;line-height:1.4;">' +
+          'Edit this customer\'s details directly on NoSpos. When you\'re finished, press Done — we\'ll save it and bring you back to Cash EPOS.' +
+        '</p>' +
+        '<div id="cg-suite-edit-panel-error" style="display:none;margin:0 0 10px 0;padding:8px 10px;background:rgba(248,113,113,0.18);border:1px solid rgba(248,113,113,0.5);border-radius:8px;font-size:12px;line-height:1.4;"></div>' +
+        '<button id="cg-suite-edit-panel-done" style="display:block;width:100%;padding:11px 14px;background:#facc15;color:#1e3a8a;' +
+          'border:none;border-radius:9999px;font-weight:800;cursor:pointer;font-size:14px;margin-bottom:8px;">Done</button>' +
+        '<button id="cg-suite-edit-panel-cancel" style="display:block;width:100%;padding:9px 14px;background:transparent;color:#e5e7eb;' +
+          'border:1px solid rgba(248,250,252,0.4);border-radius:9999px;font-weight:600;cursor:pointer;font-size:12px;">Cancel</button>' +
+      '</div>';
+    document.body.appendChild(panel);
+
+    var doneBtn = document.getElementById('cg-suite-edit-panel-done');
+    var cancelBtn = document.getElementById('cg-suite-edit-panel-cancel');
+    var errEl = document.getElementById('cg-suite-edit-panel-error');
+
+    function showPanelError(msg) {
+      if (!errEl) return;
+      if (!msg) { errEl.style.display = 'none'; errEl.textContent = ''; return; }
+      errEl.textContent = msg;
+      errEl.style.display = 'block';
+    }
+
+    function diffSnapshot(before, after) {
+      var FIELDS = [
+        ['forename', 'Forename'],
+        ['surname', 'Surname'],
+        ['dob', 'Date of Birth'],
+        ['gender', 'Gender'],
+        ['mobile', 'Mobile'],
+        ['homePhone', 'Home Phone'],
+        ['email', 'Email'],
+        ['postcode', 'Postcode'],
+        ['address1', 'Address 1'],
+        ['address2', 'Address 2'],
+        ['town', 'Town'],
+        ['county', 'County'],
+        ['emailMarketing', 'Email Marketing'],
+        ['smsMarketing', 'SMS Marketing'],
+        ['mailMarketing', 'Mail Marketing'],
+      ];
+      var out = [];
+      FIELDS.forEach(function (f) {
+        var key = f[0];
+        var label = f[1];
+        var a = before ? before[key] : '';
+        var b = after ? after[key] : '';
+        if (typeof a === 'boolean' || typeof b === 'boolean') {
+          if (!!a !== !!b) {
+            out.push({ field: label, from: a ? 'on' : 'off', to: b ? 'on' : 'off' });
+          }
+          return;
+        }
+        var sa = (a == null ? '' : String(a)).trim();
+        var sb = (b == null ? '' : String(b)).trim();
+        if (sa !== sb) out.push({ field: label, from: sa, to: sb });
+      });
+      return out;
+    }
+
+    function findSaveButton() {
+      return (
+        document.querySelector('.card-footer .btn-blue') ||
+        document.querySelector('.card-footer button[type="submit"]') ||
+        document.querySelector('.card-footer button') ||
+        document.querySelector('button[type="submit"].btn-primary') ||
+        Array.from(document.querySelectorAll('button[type="submit"], input[type="submit"]'))
+          .find(function (b) { return /save|update/i.test((b.textContent || b.value || '')); })
+      );
+    }
+
+    function buildCustomerPayload(after, changes) {
+      var customer = Object.assign({}, after, {
+        nosposCustomerId: extractNosposCustomerIdFromPath(),
+        name:    ((after.forename || '') + ' ' + (after.surname || '')).trim(),
+        phone:   after.mobile || after.homePhone,
+        address: [after.address1, after.address2, after.town, after.county, after.postcode].filter(Boolean).join(', '),
+      });
+      return customer;
+    }
+
+    function finalizeAndSend(customer, changes, opts) {
+      profilePictureToDataUrl(customer.profilePicture).then(function (embedded) {
+        customer.profilePicture = embedded || null;
+        chrome.runtime.sendMessage({
+          type: 'NOSPOS_CUSTOMER_DONE',
+          requestId: requestId,
+          cancelled: false,
+          customer: customer,
+          changes: changes || [],
+          saveFailed: !!(opts && opts.saveFailed),
+        }).catch(function () {});
+      });
+    }
+
+    doneBtn.addEventListener('click', function () {
+      doneBtn.disabled = true;
+      doneBtn.style.opacity = '0.7';
+      doneBtn.textContent = 'Saving…';
+      cancelBtn.disabled = true;
+      cancelBtn.style.opacity = '0.5';
+      showPanelError('');
+
+      var after = scrapeCustomerForm();
+      var changes = diffSnapshot(snapshot, after);
+      var customer = buildCustomerPayload(after, changes);
+
+      var saveBtn = findSaveButton();
+      if (!saveBtn) {
+        // No save button → send what we have without saving
+        try {
+          sessionStorage.setItem('cgCustomerPending', JSON.stringify({ requestId: requestId, customer: customer, changes: changes }));
+        } catch (e) {}
+        finalizeAndSend(customer, changes, {});
+        panel.remove();
+        return;
+      }
+
+      // Persist for the post-reload pickup so we still send NOSPOS_CUSTOMER_DONE
+      // when NoSpos navigates back to /customer/{id}/view.
+      try {
+        sessionStorage.setItem('cgCustomerPending', JSON.stringify({ requestId: requestId, customer: customer, changes: changes }));
+      } catch (e) {}
+
+      var saveFailedHandled = false;
+      var saveTimeout = null;
+      var observer = null;
+
+      function handleSaveFailed(errorMsg) {
+        if (saveFailedHandled) return;
+        saveFailedHandled = true;
+        if (saveTimeout) { clearTimeout(saveTimeout); saveTimeout = null; }
+        window.removeEventListener('beforeunload', onBeforeUnload);
+        if (observer) { observer.disconnect(); observer = null; }
+        var pending = null;
+        try {
+          var raw = sessionStorage.getItem('cgCustomerPending');
+          if (raw) { pending = JSON.parse(raw); sessionStorage.removeItem('cgCustomerPending'); }
+        } catch (e) {}
+        if (pending && pending.requestId) {
+          finalizeAndSend(pending.customer, pending.changes || [], { saveFailed: true });
+        }
+        panel.remove();
+        showSaveFailedPanel(errorMsg);
+      }
+
+      function onBeforeUnload() { if (saveTimeout) clearTimeout(saveTimeout); }
+
+      observer = new MutationObserver(function () {
+        if (saveFailedHandled) return;
+        var err = extractNosposErrorText();
+        if (err) handleSaveFailed(err);
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+
+      // If NoSpos hasn't reloaded within 4s, treat as save failed.
+      saveTimeout = setTimeout(function () { handleSaveFailed(''); }, 4000);
+      window.addEventListener('beforeunload', onBeforeUnload);
+
+      saveBtn.click();
+    });
+
+    cancelBtn.addEventListener('click', function () {
+      chrome.runtime.sendMessage({ type: 'NOSPOS_CUSTOMER_DONE', requestId: requestId, cancelled: true }).catch(function () {});
+      panel.remove();
+    });
+  }
+
+  // ── Legacy field builders kept for the customer-search address-lookup popup
+  //    in case other flows need them (currently unused after the modal swap).
 
   var INPUT_BASE = 'width:100%;padding:9px 12px;border:1.5px solid #e5e7eb;border-radius:8px;' +
     'font-size:14px;font-family:Inter,sans-serif;color:#111827;background:#f9fafb;box-sizing:border-box;';
 
   var LABEL_BASE = 'font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#6b7280;';
-
-  function field(id, label, value, type) {
-    return '<div style="display:flex;flex-direction:column;gap:5px;">' +
-      '<label for="' + id + '" style="' + LABEL_BASE + '">' + esc(label) + '</label>' +
-      '<input type="' + (type || 'text') + '" id="' + id + '" value="' + esc(value) +
-        '" style="' + INPUT_BASE + '" />' +
-    '</div>';
-  }
-
-  // Empty field with amber "please enter" styling
-  function emptyField(id, label, placeholder) {
-    return '<div style="display:flex;flex-direction:column;gap:5px;">' +
-      '<label for="' + id + '" style="' + LABEL_BASE + 'color:#92400e;">' +
-        esc(label) + ' <span style="color:#f59e0b;">*</span></label>' +
-      '<input type="text" id="' + id + '" value="" placeholder="' + esc(placeholder || 'Enter value…') + '" style="' +
-        INPUT_BASE + 'border-color:#fcd34d;background:#fffbeb;" />' +
-      '<div id="' + id + '-warn" style="display:none;font-size:12px;color:#b45309;font-weight:600;' +
-        'padding:6px 10px;background:#fef3c7;border-radius:6px;border:1px solid #fcd34d;"></div>' +
-    '</div>';
-  }
 
   // Address Line 1 with postcode lookup search button + mini popup
   function address1WithSearch(value) {
@@ -638,777 +859,104 @@
     '</div>';
   }
 
-  function genderSelect(currentVal) {
-    var opts = [['0','Unknown'],['1','Male'],['2','Female'],['3','Other']];
-    return '<div style="display:flex;flex-direction:column;gap:5px;">' +
-      '<label for="cg-field-gender" style="' + LABEL_BASE + '">Gender</label>' +
-      '<select id="cg-field-gender" style="' + INPUT_BASE + '">' +
-      opts.map(function(o) {
-        return '<option value="' + o[0] + '"' + (o[0] === currentVal ? ' selected' : '') + '>' + esc(o[1]) + '</option>';
-      }).join('') +
-      '</select></div>';
-  }
-
-  function checkbox(id, label, checked) {
-    return '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;font-weight:500;color:#374151;padding:6px 0;">' +
-      '<input type="checkbox" id="' + id + '"' + (checked ? ' checked' : '') +
-        ' style="width:16px;height:16px;accent-color:#1e3a8a;cursor:pointer;" />' +
-      esc(label) + '</label>';
-  }
-
-  function sectionHeader(label, color) {
-    return '<div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:0.1em;' +
-      'color:' + (color || '#1e3a8a') + ';padding-bottom:8px;border-bottom:2px solid ' +
-      (color ? '#fde68a' : '#dbeafe') + ';margin-bottom:14px;">' + esc(label) + '</div>';
-  }
-
-  function grid2(a, b) {
-    return '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">' + a + (b || '') + '</div>';
-  }
-
-  function showCustomerDetailModal(requestId) {
-    if (document.getElementById('cg-suite-customer-modal')) return;
-
-    var searchPanel = document.getElementById('cg-suite-customer-panel');
-    if (searchPanel) searchPanel.remove();
-
-    var d       = scrapeCustomerForm();
-    var changes = scrapeCustomerChanges();
-
-    // If town is empty, store a flag so we can detect a native NosPos save
-    // and switch back to the system tab even if the CG modal isn't used.
-    if (!d.town) {
-      try { sessionStorage.setItem('cgWaitingForTownFix', JSON.stringify({ requestId: requestId })); } catch (e) {}
-    }
-
-    var days          = daysSince(d.lastTransacted);
-    var recentWarning = days !== null && days >= 0 && days <= 14;
-
-    // ── stat pill helper ────────────────────────────────────────────────────────
-    function statPill(label, value, raw, goodHigh) {
-      if (!value) return '';
-      var pct = parseFloat(value);
-      var isGood = goodHigh ? pct >= 50 : pct < 5;
-      var bg    = isGood ? '#f0fdf4' : '#fff1f2';
-      var color = isGood ? '#166534' : '#9f1239';
-      var border= isGood ? '#bbf7d0' : '#fecdd3';
-      return '<div style="display:flex;flex-direction:column;align-items:center;gap:3px;' +
-        'background:' + bg + ';border:1.5px solid ' + border + ';border-radius:10px;padding:8px 14px;min-width:0;">' +
-        '<span style="font-size:18px;font-weight:900;color:' + color + ';">' + esc(value) + '</span>' +
-        '<span style="font-size:10px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.07em;">' + esc(label) + '</span>' +
-        (raw ? '<span style="font-size:10px;color:#9ca3af;margin-top:1px;">' + esc(raw) + '</span>' : '') +
-        '</div>';
-    }
-
-    var hasStats = d.buyBackRate || d.renewRate || d.cancelRate || d.faultyRate;
-
-    var overlay = document.createElement('div');
-    overlay.id = 'cg-suite-customer-modal';
-    overlay.style.cssText =
-      'position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,0.7);' +
-      'backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);' +
-      'display:flex;align-items:center;justify-content:center;pointer-events:auto;padding:24px;';
-
-    overlay.innerHTML =
-      '<div id="cg-modal-card" style="background:white;border-radius:20px;width:100%;max-width:700px;' +
-        'max-height:92vh;display:flex;flex-direction:column;' +
-        'box-shadow:0 32px 80px rgba(0,0,0,0.5);font-family:Inter,sans-serif;overflow:hidden;">' +
-
-        // Header
-        '<div style="background:#1e3a8a;padding:20px 28px 0;flex-shrink:0;">' +
-          '<div style="display:flex;align-items:center;gap:14px;padding-bottom:16px;">' +
-            '<div>' +
-              '<p style="margin:0;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:rgba(255,255,255,0.6);">CG Suite</p>' +
-              '<h2 style="margin:2px 0 0;font-size:18px;font-weight:800;color:white;">' + esc((d.forename + ' ' + d.surname).trim() || 'Customer Profile') + '</h2>' +
-            '</div>' +
-          '</div>' +
-          // Tab bar
-          '<div style="display:flex;gap:0;">' +
-            '<button id="cg-tab-details" style="padding:9px 20px;background:white;color:#1e3a8a;border:none;' +
-              'font-weight:800;font-size:13px;cursor:pointer;border-radius:10px 10px 0 0;font-family:Inter,sans-serif;">' +
-              'Details</button>' +
-            '<button id="cg-tab-changes" style="padding:9px 20px;background:rgba(255,255,255,0.15);color:rgba(255,255,255,0.7);border:none;' +
-              'font-weight:700;font-size:13px;cursor:pointer;border-radius:10px 10px 0 0;font-family:Inter,sans-serif;">' +
-              'Changes' + (changes.length ? ' <span style="background:#facc15;color:#1e3a8a;border-radius:20px;padding:1px 7px;font-size:11px;">' + changes.length + '</span>' : '') +
-            '</button>' +
-          '</div>' +
-        '</div>' +
-
-        // ── Details pane ────────────────────────────────────────────────────────
-        '<div id="cg-pane-details" style="overflow-y:auto;padding:24px 28px;flex:1;">' +
-
-          // ── Last transacted info bar ────────────────────────────────────────
-          (d.lastTransacted
-            ? '<div style="background:#f0f9ff;border:1.5px solid #bae6fd;border-radius:10px;' +
-              'padding:10px 14px;margin-bottom:18px;font-size:12px;color:#0369a1;font-weight:600;">' +
-              'Last transacted: ' + esc(d.lastTransacted) +
-              (days !== null ? ' (' + days + ' day' + (days === 1 ? '' : 's') + ' ago)' : '') +
-              '</div>'
-            : ''
-          ) +
-
-          // ── Transaction stats ───────────────────────────────────────────────
-          (hasStats
-            ? '<div style="margin-bottom:20px;">' +
-              sectionHeader('Transaction History') +
-              // Transaction counts row
-              ((d.buyingCount || d.salesCount)
-                ? '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">' +
-                  (d.buyingCount
-                    ? '<div style="background:#f0f9ff;border:1.5px solid #bae6fd;border-radius:10px;padding:10px 14px;display:flex;align-items:center;gap:10px;">' +
-                      '<span style="font-size:18px;font-weight:900;color:#0369a1;">B</span>' +
-                      '<div><p style="margin:0;font-size:22px;font-weight:900;color:#0c4a6e;line-height:1;">' + esc(d.buyingCount) + '</p>' +
-                      '<p style="margin:0;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#7dd3fc;">Buying Transactions</p></div>' +
-                      '</div>'
-                    : '') +
-                  (d.salesCount
-                    ? '<div style="background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:10px;padding:10px 14px;display:flex;align-items:center;gap:10px;">' +
-                      '<span style="font-size:18px;font-weight:900;color:#166534;">S</span>' +
-                      '<div><p style="margin:0;font-size:22px;font-weight:900;color:#14532d;line-height:1;">' + esc(d.salesCount) + '</p>' +
-                      '<p style="margin:0;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#86efac;">Sales Transactions</p></div>' +
-                      '</div>'
-                    : '') +
-                  '</div>'
-                : '') +
-              '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;">' +
-                statPill('Buy Back',  d.buyBackRate, d.buyBackRateRaw, true)  +
-                statPill('Renew',     d.renewRate,   d.renewRateRaw,   true)  +
-                statPill('Cancel',    d.cancelRate,  d.cancelRateRaw,  true)  +
-                statPill('Faulty',    d.faultyRate,  d.faultyRateRaw,  false) +
-              '</div></div>'
-            : ''
-          ) +
-
-          // ── Photo + Verify inputs side by side ──
-          '<div style="display:flex;gap:18px;align-items:flex-start;' +
-            'background:#fffbeb;border:1.5px solid #fcd34d;border-radius:12px;padding:16px 18px;margin-bottom:20px;">' +
-
-            // Photo
-            (d.profilePicture
-              ? '<img src="' + esc(d.profilePicture) + '" style="width:160px;flex-shrink:0;' +
-                'height:auto;border-radius:10px;display:block;object-fit:contain;" />'
-              : '<div style="width:160px;flex-shrink:0;height:200px;background:#dbeafe;border-radius:10px;' +
-                'display:flex;align-items:center;justify-content:center;">' +
-                '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#93c5fd" stroke-width="1.5">' +
-                '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>' +
-                '</svg></div>'
-            ) +
-
-            // Verify inputs
-            '<div style="flex:1;min-width:0;">' +
-              '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:' + (recentWarning ? '8px' : '12px') + ';">' +
-                '<div style="display:flex;align-items:center;gap:6px;min-width:0;">' +
-                  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#d97706" stroke-width="2.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' +
-                  '<span style="font-size:11px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:0.06em;">Enter from your own knowledge</span>' +
-                '</div>' +
-                '<button id="cg-customer-bypass" type="button" style="padding:8px 14px;background:white;' +
-                  'color:#166534;border:1px solid #86efac;border-radius:9999px;font-weight:700;' +
-                  'cursor:pointer;font-size:12px;font-family:Inter,sans-serif;white-space:nowrap;">Bypass</button>' +
-              '</div>' +
-              (recentWarning
-                ? '<div style="background:#f0fdf4;border:1.5px solid #86efac;border-radius:8px;' +
-                  'padding:8px 12px;margin-bottom:12px;font-size:12px;color:#166534;font-weight:600;' +
-                  'display:flex;align-items:center;gap:7px;">' +
-                  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5">' +
-                  '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>' +
-                  'Last transaction was ' + days + ' day' + (days === 1 ? '' : 's') + ' ago.' +
-                  '</div>'
-                : ''
-              ) +
-              grid2(
-                emptyField('cg-field-mobile',   'Mobile Phone',   'Type the number you know'),
-                (d.email ? emptyField('cg-field-email',     'Email Address',  'Type the address you know') : '<div></div>')
-              ) +
-              '<div style="margin-top:10px;">' +
-              grid2(
-                emptyField('cg-field-postcode',  'Postcode',       'Type the postcode you know'),
-                address1WithSearch('')
-              ) + '</div>' +
-            '</div>' +
-
-          '</div>' +
-
-          // Personal
-          sectionHeader('Personal Details') +
-          grid2(
-            field('cg-field-forename', 'Forename', d.forename),
-            field('cg-field-surname',  'Surname',  d.surname)
-          ) +
-          '<div style="margin-top:12px;">' +
-          grid2(
-            field('cg-field-dob', 'Date of Birth', d.dob, 'date'),
-            genderSelect(d.gender)
-          ) + '</div>' +
-
-          // Address (non-sensitive fields)
-          '<div style="margin-top:20px;">' + sectionHeader('Additional Address') + '</div>' +
-          grid2(
-            field('cg-field-address2', 'Address Line 2', d.address2),
-            // Town has a required-warn div appended
-            '<div style="display:flex;flex-direction:column;gap:5px;">' +
-              '<label for="cg-field-town" style="' + LABEL_BASE + 'color:#92400e;">Town <span style="color:#f59e0b;">*</span></label>' +
-              '<input type="text" id="cg-field-town" value="' + esc(d.town) + '" placeholder="Required" style="' + INPUT_BASE + 'border-color:' + (d.town ? '#e5e7eb' : '#fcd34d') + ';background:' + (d.town ? '#f9fafb' : '#fffbeb') + ';" />' +
-              '<div id="cg-field-town-warn" style="display:none;font-size:12px;color:#b45309;font-weight:600;padding:6px 10px;background:#fef3c7;border-radius:6px;border:1px solid #fcd34d;"></div>' +
-            '</div>'
-          ) +
-          '<div style="margin-top:12px;">' +
-          field('cg-field-county', 'County', d.county) +
-          '</div>' +
-
-          // Marketing
-          '<div style="margin-top:20px;">' + sectionHeader('Marketing Preferences') + '</div>' +
-          '<div style="display:flex;gap:20px;flex-wrap:wrap;">' +
-            checkbox('cg-field-email-mkt', 'Email Marketing', d.emailMarketing) +
-            checkbox('cg-field-sms-mkt',   'SMS Marketing',   d.smsMarketing) +
-            checkbox('cg-field-mail-mkt',  'Mail Marketing',  d.mailMarketing) +
-          '</div>' +
-
-        '</div>' + // end details pane
-
-        // ── Changes pane ─────────────────────────────────────────────────────
-        '<div id="cg-pane-changes" style="display:none;overflow-y:auto;padding:24px 28px;flex:1;">' +
-          (changes.length === 0
-            ? '<p style="text-align:center;color:#9ca3af;font-size:13px;padding:40px 0;">No changes recorded.</p>'
-            : '<table style="width:100%;border-collapse:collapse;font-size:12px;">' +
-              '<thead><tr style="border-bottom:2px solid #e5e7eb;">' +
-                '<th style="text-align:left;padding:6px 8px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:0.07em;color:#6b7280;">Field</th>' +
-                '<th style="text-align:left;padding:6px 8px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:0.07em;color:#6b7280;">Old</th>' +
-                '<th style="text-align:left;padding:6px 8px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:0.07em;color:#6b7280;">New</th>' +
-                '<th style="text-align:left;padding:6px 8px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:0.07em;color:#6b7280;">Changed</th>' +
-                '<th style="text-align:left;padding:6px 8px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:0.07em;color:#6b7280;">By</th>' +
-              '</tr></thead>' +
-              '<tbody>' +
-              changes.map(function (c, i) {
-                var bg = i % 2 === 0 ? '#ffffff' : '#f9fafb';
-                return '<tr style="border-bottom:1px solid #f3f4f6;background:' + bg + ';">' +
-                  '<td style="padding:7px 8px;font-weight:700;color:#1e3a8a;">' + esc(c.field) + '</td>' +
-                  '<td style="padding:7px 8px;color:#6b7280;font-family:monospace;">' + esc(c.oldValue || '—') + '</td>' +
-                  '<td style="padding:7px 8px;color:#111827;font-family:monospace;font-weight:600;">' + esc(c.newValue || '—') + '</td>' +
-                  '<td style="padding:7px 8px;color:#6b7280;white-space:nowrap;">' + esc(c.changedAt) + '</td>' +
-                  '<td style="padding:7px 8px;color:#374151;font-weight:600;">' + esc(c.changedBy) + '</td>' +
-                  '</tr>';
-              }).join('') +
-              '</tbody></table>'
-          ) +
-        '</div>' + // end changes pane
-
-        // Footer
-        '<div style="padding:16px 28px;border-top:1px solid #f3f4f6;display:flex;gap:12px;' +
-          'justify-content:flex-end;align-items:center;background:#fafafa;flex-shrink:0;">' +
-          '<button id="cg-customer-cancel" style="padding:10px 20px;background:transparent;' +
-            'color:#6b7280;border:1.5px solid #e5e7eb;border-radius:10px;font-weight:600;' +
-            'cursor:pointer;font-size:14px;font-family:Inter,sans-serif;">Cancel</button>' +
-          '<button id="cg-customer-use" style="padding:10px 28px;background:#facc15;' +
-            'color:#1e3a8a;border:none;border-radius:10px;font-weight:800;cursor:pointer;' +
-            'font-size:14px;font-family:Inter,sans-serif;box-shadow:0 4px 12px rgba(250,204,21,0.4);">' +
-            'OK</button>' +
-        '</div>' + // end footer
-
-      '</div>'; // end modal card
-
-    document.body.appendChild(overlay);
-
-    // ── Tab switching ─────────────────────────────────────────────────────────
-    var tabDetails   = document.getElementById('cg-tab-details');
-    var tabChanges   = document.getElementById('cg-tab-changes');
-    var paneDetails  = document.getElementById('cg-pane-details');
-    var paneChanges  = document.getElementById('cg-pane-changes');
-
-    function activateTab(tab) {
-      var isDetails = tab === 'details';
-      tabDetails.style.background  = isDetails ? 'white' : 'rgba(255,255,255,0.15)';
-      tabDetails.style.color        = isDetails ? '#1e3a8a' : 'rgba(255,255,255,0.7)';
-      tabChanges.style.background  = !isDetails ? 'white' : 'rgba(255,255,255,0.15)';
-      tabChanges.style.color        = !isDetails ? '#1e3a8a' : 'rgba(255,255,255,0.7)';
-      paneDetails.style.display    = isDetails ? '' : 'none';
-      paneChanges.style.display    = !isDetails ? '' : 'none';
-    }
-
-    tabDetails.addEventListener('click', function () { activateTab('details'); });
-    tabChanges.addEventListener('click', function () { activateTab('changes'); });
-
-    // ── Address lookup (Ideal Postcodes via extension background) ─────────────────
-    var popup = document.getElementById('cg-address-popup');
-    var popupList = document.getElementById('cg-address-popup-list');
-    var popupLoading = document.getElementById('cg-address-popup-loading');
-    var popupEmpty = document.getElementById('cg-address-popup-empty');
-    var popupError = document.getElementById('cg-address-popup-error');
-    var searchBtn = document.getElementById('cg-address-search-btn');
-    var address1Input = document.getElementById('cg-field-address1');
-    var address1Wrap = document.getElementById('cg-address1-wrap');
-
-    function hideAddressPopup() {
-      if (popup) popup.style.display = 'none';
-    }
-
-    function showAddressPopup() {
-      if (!popup) return;
-      popupList.style.display = '';
-      popupLoading.style.display = 'none';
-      popupEmpty.style.display = 'none';
-      popupError.style.display = 'none';
-      popup.style.display = 'block';
-    }
-
-    function closePopupOnClickOutside(e) {
-      if (address1Wrap && popup && !address1Wrap.contains(e.target)) {
-        hideAddressPopup();
-        document.removeEventListener('click', closePopupOnClickOutside);
-      }
-    }
-
-    if (searchBtn && popup) {
-      searchBtn.addEventListener('click', function () {
-        var postcode = (document.getElementById('cg-field-postcode').value || '').trim();
-        if (!postcode || postcode.replace(/\s+/g, '').length < 4) {
-          popupList.innerHTML = '';
-          popupList.style.display = 'none';
-          popupLoading.style.display = 'none';
-          popupEmpty.style.display = 'block';
-          popupEmpty.textContent = 'Enter a postcode first (min 4 chars)';
-          popupError.style.display = 'none';
-          popup.style.display = 'block';
-          setTimeout(function () { document.addEventListener('click', closePopupOnClickOutside); }, 0);
-          return;
-        }
-        popupList.innerHTML = '';
-        popupList.style.display = 'none';
-        popupLoading.style.display = 'block';
-        popupEmpty.style.display = 'none';
-        popupError.style.display = 'none';
-        popup.style.display = 'block';
-        setTimeout(function () { document.addEventListener('click', closePopupOnClickOutside); }, 0);
-
-        chrome.runtime.sendMessage({ type: 'FETCH_ADDRESS_SUGGESTIONS', postcode: postcode }, function (res) {
-          popupLoading.style.display = 'none';
-          if (!res || !res.ok) {
-            popupError.textContent = res && res.error ? res.error : 'Address lookup failed';
-            popupError.style.display = 'block';
-            popupEmpty.style.display = 'none';
-            popupList.style.display = 'none';
-            return;
-          }
-          var addresses = res.addresses || [];
-          if (addresses.length === 0) {
-            popupEmpty.textContent = 'No addresses found. Check the postcode (e.g. L13 9AE) and that Django is running at http://127.0.0.1:8000';
-            popupEmpty.style.display = 'block';
-            popupList.style.display = 'none';
-            return;
-          }
-          popupEmpty.style.display = 'none';
-          popupList.style.display = 'block';
-          popupList.innerHTML = addresses.map(function (addr, i) {
-            var display = [addr.line_1, addr.line_2, addr.line_3, addr.post_town, addr.postcode].filter(Boolean).join(', ');
-            if (!display) display = 'Address ' + (i + 1);
-            return '<div class="cg-address-item" data-index="' + i + '" style="padding:10px 14px;cursor:pointer;border-bottom:1px solid #f3f4f6;' +
-              'transition:background 0.15s;" onmouseover="this.style.background=\'#f0f9ff\'" onmouseout="this.style.background=\'transparent\'">' +
-              esc(display) + '</div>';
-          }).join('');
-          popupList.querySelectorAll('.cg-address-item').forEach(function (el) {
-            el.addEventListener('click', function () {
-              var idx = parseInt(el.getAttribute('data-index'), 10);
-              if (isNaN(idx) || idx < 0 || idx >= addresses.length) return;
-              var addr = addresses[idx];
-              hideAddressPopup();
-              document.removeEventListener('click', closePopupOnClickOutside);
-              var line1 = addr.line_1 || '';
-              var line2 = addr.line_2 || '';
-              var line3 = addr.line_3 || '';
-              var town = addr.post_town || '';
-              var county = addr.county || '';
-              var pc = addr.postcode || '';
-              var addr2Val = [line2, line3].filter(Boolean).join(', ');
-              if (address1Input) { address1Input.value = line1; address1Input.dispatchEvent(new Event('input', { bubbles: true })); }
-              var addr2 = document.getElementById('cg-field-address2');
-              if (addr2) { addr2.value = addr2Val; addr2.dispatchEvent(new Event('input', { bubbles: true })); }
-              var townEl = document.getElementById('cg-field-town');
-              if (townEl) { townEl.value = town; townEl.dispatchEvent(new Event('input', { bubbles: true })); townEl.style.borderColor = '#e5e7eb'; townEl.style.background = '#f9fafb'; }
-              var countyEl = document.getElementById('cg-field-county');
-              if (countyEl) { countyEl.value = county; countyEl.dispatchEvent(new Event('input', { bubbles: true })); }
-              var postEl = document.getElementById('cg-field-postcode');
-              if (postEl && pc) { postEl.value = pc; postEl.dispatchEvent(new Event('input', { bubbles: true })); }
-              showFieldWarn('cg-field-town', '');
-            });
-          });
-        });
-      });
-    }
-
-    var phoneWarningAcknowledged = false;
-
-    function getFieldVal(id) {
-      var el = document.getElementById(id);
-      return el ? (el.value || '').trim() : '';
-    }
-
-    function showFieldWarn(id, msg) {
-      var w = document.getElementById(id + '-warn');
-      if (w) { w.textContent = msg; w.style.display = msg ? 'block' : 'none'; }
-    }
-
-    var useBtn = document.getElementById('cg-customer-use');
-
-    var hasEmailInNospos = !!(d.email && d.email.trim());
-
-    function validateVerifyFields() {
-      var phone = getFieldVal('cg-field-mobile');
-      var email = hasEmailInNospos ? getFieldVal('cg-field-email') : '';
-      var post = getFieldVal('cg-field-postcode');
-      var addr1 = getFieldVal('cg-field-address1');
-      var town = getFieldVal('cg-field-town');
-      if (!phone) { showFieldWarn('cg-field-mobile', 'Mobile is required.'); document.getElementById('cg-field-mobile').focus(); return false; }
-      showFieldWarn('cg-field-mobile', '');
-      if (hasEmailInNospos && !email) { showFieldWarn('cg-field-email', 'Email is required.'); document.getElementById('cg-field-email').focus(); return false; }
-      if (hasEmailInNospos) showFieldWarn('cg-field-email', '');
-      if (!post) { showFieldWarn('cg-field-postcode', 'Postcode is required.'); document.getElementById('cg-field-postcode').focus(); return false; }
-      showFieldWarn('cg-field-postcode', '');
-      if (!addr1) { showFieldWarn('cg-field-address1', 'Address Line 1 is required.'); document.getElementById('cg-field-address1').focus(); return false; }
-      showFieldWarn('cg-field-address1', '');
-      if (!town) { showFieldWarn('cg-field-town', 'Town is required.'); document.getElementById('cg-field-town').focus(); return false; }
-      showFieldWarn('cg-field-town', '');
-      return true;
-    }
-
-    function showBypassReasonPrompt(callback) {
-      var promptOverlay = document.createElement('div');
-      promptOverlay.id = 'cg-bypass-reason-overlay';
-      promptOverlay.style.cssText =
-        'position:fixed;inset:0;z-index:2147483648;background:rgba(15,23,42,0.65);' +
-        'display:flex;align-items:center;justify-content:center;pointer-events:auto;';
-      promptOverlay.innerHTML =
-        '<div style="background:white;border-radius:16px;padding:28px 32px;width:100%;max-width:400px;' +
-          'box-shadow:0 24px 60px rgba(0,0,0,0.55);font-family:Inter,sans-serif;">' +
-          '<h3 style="margin:0 0 6px;font-size:17px;font-weight:800;color:#1e3a8a;">Bypass Reason</h3>' +
-          '<p style="margin:0 0 16px;font-size:13px;color:#64748b;">Please provide a reason for bypassing customer verification.</p>' +
-          '<input id="cg-bypass-reason-input" type="text" placeholder="Enter reason..." ' +
-            'style="width:100%;box-sizing:border-box;padding:10px 14px;border:1.5px solid #e5e7eb;border-radius:10px;' +
-            'font-size:14px;font-family:Inter,sans-serif;outline:none;margin-bottom:18px;" />' +
-          '<div style="display:flex;gap:10px;justify-content:flex-end;">' +
-            '<button id="cg-bypass-cancel-btn" type="button" ' +
-              'style="padding:9px 20px;background:#f1f5f9;color:#475569;border:none;border-radius:9999px;' +
-              'font-weight:700;font-size:13px;cursor:pointer;font-family:Inter,sans-serif;">Cancel</button>' +
-            '<button id="cg-bypass-ok-btn" type="button" ' +
-              'style="padding:9px 20px;background:#1e3a8a;color:white;border:none;border-radius:9999px;' +
-              'font-weight:700;font-size:13px;cursor:pointer;font-family:Inter,sans-serif;">OK</button>' +
-          '</div>' +
-        '</div>';
-      document.body.appendChild(promptOverlay);
-
-      var input = document.getElementById('cg-bypass-reason-input');
-      var okBtn = document.getElementById('cg-bypass-ok-btn');
-      var cancelBtn = document.getElementById('cg-bypass-cancel-btn');
-
-      setTimeout(function () { input.focus(); }, 50);
-
-      function dismiss(reason) {
-        promptOverlay.remove();
-        callback(reason);
-      }
-
-      okBtn.addEventListener('click', function () {
-        var val = (input.value || '').trim();
-        if (!val) {
-          input.style.borderColor = '#ef4444';
-          input.focus();
-          return;
-        }
-        dismiss(val);
-      });
-
-      cancelBtn.addEventListener('click', function () { dismiss(null); });
-
-      input.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') { okBtn.click(); }
-        if (e.key === 'Escape') { cancelBtn.click(); }
-      });
-    }
-
-    function proceedWithCustomerData(bypassReason) {
-      if (bypassReason && !recentWarning) {
-        showBypassReasonPrompt(function (manualReason) {
-          if (manualReason == null) return;
-          _doProceedWithCustomerData(manualReason);
-        });
-        return;
-      }
-      _doProceedWithCustomerData(bypassReason);
-    }
-
-    function _doProceedWithCustomerData(bypassReason) {
-      // The scraped photo is a session-protected relative NoSpos URL the web
-      // app can't load. Embed it as a base64 data URL here (we have the NoSpos
-      // session), then re-enter so all downstream send paths get the inlined
-      // image. Race-safe: clicks while the fetch is pending just wait.
-      if (d && d.profilePicture && !/^data:/i.test(d.profilePicture)) {
-        if (!d._photoEmbedStarted) {
-          d._photoEmbedStarted = true;
-          profilePictureToDataUrl(d.profilePicture).then(function (embedded) {
-            d.profilePicture = embedded || null;
-            _doProceedWithCustomerData(bypassReason);
-          });
-        }
-        return;
-      }
-
-      var enteredPhone   = getFieldVal('cg-field-mobile');
-      var enteredEmail   = getFieldVal('cg-field-email');
-      var enteredPost    = getFieldVal('cg-field-postcode');
-      var enteredAddr1   = getFieldVal('cg-field-address1');
-      var enteredTown    = getFieldVal('cg-field-town');
-
-      if (bypassReason) {
-        enteredPhone = enteredPhone || d.mobile;
-        enteredEmail = enteredEmail || d.email;
-        enteredPost  = enteredPost  || d.postcode;
-        enteredAddr1 = enteredAddr1 || d.address1;
-        enteredTown  = enteredTown  || d.town;
-      }
-
-      if (!bypassReason && !phoneWarningAcknowledged && enteredPhone && d.mobile && enteredPhone !== d.mobile) {
-        var dist = phoneDigitMismatches(enteredPhone, d.mobile);
-        if (dist >= 1 && dist <= 2) {
-          showFieldWarn('cg-field-mobile',
-            'This looks very similar to what\'s on NoSpos (' + d.mobile + '). Are you sure it\'s correct? Press OK again to confirm.');
-          phoneWarningAcknowledged = true;
-          return;
-        }
-      }
-      showFieldWarn('cg-field-mobile', '');
-
-      // ── Collect all final values from modal ───────────────────────────────
-      var finalForename  = getFieldVal('cg-field-forename');
-      var finalSurname   = getFieldVal('cg-field-surname');
-      var finalDob       = getFieldVal('cg-field-dob');
-      var finalGender    = getFieldVal('cg-field-gender');
-      var finalAddr2     = getFieldVal('cg-field-address2');
-      var finalCounty    = getFieldVal('cg-field-county');
-      var finalEmailMkt  = !!(document.getElementById('cg-field-email-mkt') && document.getElementById('cg-field-email-mkt').checked);
-      var finalSmsMkt    = !!(document.getElementById('cg-field-sms-mkt')   && document.getElementById('cg-field-sms-mkt').checked);
-      var finalMailMkt   = !!(document.getElementById('cg-field-mail-mkt')  && document.getElementById('cg-field-mail-mkt').checked);
-
-      // ── Sync every changed field back to nospos ───────────────────────────
-      function updateNosposCheckbox(sel, value) {
-        var el = document.querySelector(sel);
-        if (!el || el.checked === value) return;
-        el.checked = value;
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-
-      if (finalForename  !== d.forename)   updateNosposField('#customer-forename',   finalForename);
-      if (finalSurname   !== d.surname)    updateNosposField('#customer-surname',     finalSurname);
-      if (enteredPhone   && enteredPhone   !== d.mobile)    updateNosposField('#customer-mobile',    enteredPhone);
-      if (enteredEmail   && enteredEmail   !== d.email)     updateNosposField('#customer-email',      enteredEmail);
-      if (enteredPost    && enteredPost    !== d.postcode)  updateNosposField('#customer-postcode',   enteredPost);
-      if (enteredAddr1   && enteredAddr1   !== d.address1)  updateNosposField('#customer-address1',   enteredAddr1);
-      if (finalAddr2     !== d.address2)   updateNosposField('#customer-address2',   finalAddr2);
-      if (enteredTown    !== d.town)       updateNosposField('#customer-address3',   enteredTown);
-      if (finalCounty    !== d.county)     updateNosposField('#customer-address4',   finalCounty);
-      if (finalDob       !== d.dob)        updateNosposField('#customer-dob',         finalDob);
-      if (finalGender    !== d.gender)     updateNosposField('#customer-gender',      finalGender);
-      updateNosposCheckbox('#customer-email_marketing_ok', finalEmailMkt);
-      updateNosposCheckbox('#customer-sms_marketing_ok',   finalSmsMkt);
-      updateNosposCheckbox('#customer-direct_mail_ok',     finalMailMkt);
-
-      // ── Build changes log (fields the user explicitly updated) ────────────
-      var changes = [];
-      if (enteredPhone && enteredPhone !== d.mobile)   changes.push({ field: 'Phone',      from: d.mobile,   to: enteredPhone });
-      if (enteredEmail && enteredEmail !== d.email)    changes.push({ field: 'Email',      from: d.email,    to: enteredEmail });
-      if (enteredPost  && enteredPost  !== d.postcode) changes.push({ field: 'Postcode',   from: d.postcode, to: enteredPost  });
-      if (enteredAddr1 && enteredAddr1 !== d.address1) changes.push({ field: 'Address 1',  from: d.address1, to: enteredAddr1 });
-      if (enteredTown  !== d.town)                     changes.push({ field: 'Town',        from: d.town,     to: enteredTown  });
-
-      var customer = {
-        nosposCustomerId: extractNosposCustomerIdFromPath(),
-        profilePicture: d.profilePicture,
-        forename:       finalForename,
-        surname:        finalSurname,
-        dob:            finalDob,
-        gender:         finalGender,
-        mobile:         enteredPhone || d.mobile,
-        homePhone:      d.homePhone,
-        email:          enteredEmail || d.email,
-        address1:       enteredAddr1 || d.address1,
-        address2:       finalAddr2,
-        town:           enteredTown,
-        county:         finalCounty,
-        postcode:       enteredPost  || d.postcode,
-        emailMarketing: finalEmailMkt,
-        smsMarketing:   finalSmsMkt,
-        mailMarketing:  finalMailMkt,
-        // Transaction history stats
-        lastTransacted:    d.lastTransacted,
-        joined:            d.joined,
-        buyBackRate:       d.buyBackRate,
-        buyBackRateRaw:    d.buyBackRateRaw,
-        renewRate:         d.renewRate,
-        renewRateRaw:      d.renewRateRaw,
-        cancelRate:        d.cancelRate,
-        cancelRateRaw:     d.cancelRateRaw,
-        faultyRate:        d.faultyRate,
-        faultyRateRaw:     d.faultyRateRaw,
-        buyingCount:       d.buyingCount,
-        salesCount:        d.salesCount,
-      };
-      customer.name    = (customer.forename + ' ' + customer.surname).trim();
-      customer.phone   = customer.mobile || customer.homePhone;
-      customer.address = [customer.address1, customer.address2, customer.town, customer.county, customer.postcode].filter(Boolean).join(', ');
-      if (bypassReason) {
-        customer.bypassReason = bypassReason;
-        changes.push({ field: 'Bypass', from: '', to: bypassReason });
-      }
-
-      // Find the nospos Save button
-      var saveBtn = document.querySelector('.card-footer .btn-blue') ||
-        document.querySelector('.card-footer button');
-
-      if (!saveBtn) {
-        // No save button found — send directly without saving
-        chrome.runtime.sendMessage({ type: 'NOSPOS_CUSTOMER_DONE', requestId: requestId, cancelled: false, customer: customer, changes: changes }).catch(function () {});
-        overlay.remove();
-        return;
-      }
-
-      // Store data in sessionStorage so we can retrieve it after the page reloads
-      try {
-        sessionStorage.setItem('cgCustomerPending', JSON.stringify({ requestId: requestId, customer: customer, changes: changes }));
-      } catch (e) {}
-
-      // Show saving state
-      useBtn.textContent = 'Saving…';
-      useBtn.disabled = true;
-      useBtn.style.opacity = '0.7';
-      var bypassBtnEl = document.getElementById('cg-customer-bypass');
-      if (bypassBtnEl) { bypassBtnEl.disabled = true; bypassBtnEl.style.opacity = '0.5'; }
-
-      var saveFailedHandled = false;
-      var saveTimeout = null;
-
-      function handleSaveFailed(errorMsg) {
-        if (saveFailedHandled) return;
-        saveFailedHandled = true;
-        if (saveTimeout) { clearTimeout(saveTimeout); saveTimeout = null; }
-        window.removeEventListener('beforeunload', onBeforeUnload);
-        if (observer) { observer.disconnect(); observer = null; }
-        var pending = null;
-        try {
-          var raw = sessionStorage.getItem('cgCustomerPending');
-          if (raw) { pending = JSON.parse(raw); sessionStorage.removeItem('cgCustomerPending'); }
-        } catch (e) {}
-        if (pending && pending.requestId) {
-          chrome.runtime.sendMessage({
-            type: 'NOSPOS_CUSTOMER_DONE',
-            requestId: pending.requestId,
-            cancelled: false,
-            customer: pending.customer,
-            changes: pending.changes || [],
-            saveFailed: true
-          }).catch(function () {});
-        }
-        overlay.remove();
-        showSaveFailedPanel(errorMsg);
-      }
-
-      function onBeforeUnload() { clearTimeout(saveTimeout); }
-
-      var observer = null;
-      observer = new MutationObserver(function () {
-        if (saveFailedHandled) return;
-        var err = extractNosposErrorText();
-        if (err) handleSaveFailed(err);
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
-
-      // Fallback: if nospos doesn't reload within 4 s, assume save failed (e.g. network error)
-      saveTimeout = setTimeout(function () { handleSaveFailed(''); }, 4000);
-
-      window.addEventListener('beforeunload', onBeforeUnload);
-
-      saveBtn.click();
-    }
-
-    document.getElementById('cg-customer-use').addEventListener('click', function () {
-      if (!validateVerifyFields()) return;
-      proceedWithCustomerData();
-    });
-
-    var bypassBtn = document.getElementById('cg-customer-bypass');
-    if (bypassBtn) {
-      bypassBtn.addEventListener('click', function () {
-        proceedWithCustomerData('14 days ago');
-      });
-    }
-
-    document.getElementById('cg-customer-cancel').addEventListener('click', function () {
-      overlay.remove();
-      window.location.href = '/customers';
-    });
-  }
-
   function onCustomerDetailPageLoad() {
-    // After a successful nospos save the page reloads — pick up the stored data
+    // After a successful NoSpos save the page reloads — pick up the stored
+    // pending payload (set by the side panel before it clicked Save) and
+    // dispatch NOSPOS_CUSTOMER_DONE with the diff we already computed.
     var pending = null;
     try {
       var raw = sessionStorage.getItem('cgCustomerPending');
       if (raw) {
         pending = JSON.parse(raw);
         sessionStorage.removeItem('cgCustomerPending');
-        sessionStorage.removeItem('cgWaitingForTownFix');
       }
     } catch (e) {}
 
     if (pending && pending.requestId) {
-      chrome.runtime.sendMessage({
-        type: 'NOSPOS_CUSTOMER_DONE',
-        requestId: pending.requestId,
-        cancelled: false,
-        customer: pending.customer,
-        changes: pending.changes || []
-      }).catch(function () {});
-      return; // don't show the modal again
+      var c = pending.customer || {};
+      profilePictureToDataUrl(c.profilePicture).then(function (embedded) {
+        c.profilePicture = embedded || c.profilePicture || null;
+        chrome.runtime.sendMessage({
+          type: 'NOSPOS_CUSTOMER_DONE',
+          requestId: pending.requestId,
+          cancelled: false,
+          customer: c,
+          changes: pending.changes || []
+        }).catch(function () {});
+      });
+      return;
     }
 
-    // If the user was prompted to fill in the town field and has now saved
-    // the NosPos form natively (without going through the CG modal save flow),
-    // detect the populated town and switch back to the system tab.
-    var townFixPending = null;
-    try {
-      var rawTownFix = sessionStorage.getItem('cgWaitingForTownFix');
-      if (rawTownFix) { townFixPending = JSON.parse(rawTownFix); }
-    } catch (e) {}
-
-    if (townFixPending && townFixPending.requestId) {
-      var townEl = document.querySelector('#customer-address3');
-      var currentTown = townEl ? (townEl.value || '').trim() : '';
-      if (currentTown) {
-        sessionStorage.removeItem('cgWaitingForTownFix');
-        var customer = scrapeCustomerForm();
-        customer.nosposCustomerId = extractNosposCustomerIdFromPath();
-        customer.name    = (customer.forename + ' ' + customer.surname).trim();
-        customer.phone   = customer.mobile || customer.homePhone;
-        customer.address = [customer.address1, customer.address2, customer.town, customer.county, customer.postcode].filter(Boolean).join(', ');
-        profilePictureToDataUrl(customer.profilePicture).then(function (embedded) {
-          customer.profilePicture = embedded || null;
-          chrome.runtime.sendMessage({
-            type: 'NOSPOS_CUSTOMER_DONE',
-            requestId: townFixPending.requestId,
-            cancelled: false,
-            customer: customer,
-            changes: [{ field: 'Town', from: '', to: currentTown }]
-          }).catch(function () {});
-        });
-        return;
-      }
-      // Town still empty — fall through to show the modal again
-    }
-
-    // Normal flow: show modal
+    // Normal flow: show the side panel — the background tells us which flow
+    // (existing-customer edit vs new-customer post-create) so we pick the
+    // right copy and button behavior.
     chrome.runtime.sendMessage({ type: 'NOSPOS_CUSTOMER_DETAIL_READY' }, function (response) {
-      if (response && response.ok && response.requestId) {
-        showCustomerDetailModal(response.requestId);
+      if (!response || !response.ok || !response.requestId) return;
+      if (response.flow === 'newCreate') {
+        showNewCustomerPostCreatePanel(response.requestId);
       } else {
-        // Background no longer has a pending entry — clear any stale flag
-        sessionStorage.removeItem('cgWaitingForTownFix');
+        showCustomerEditPanel(response.requestId);
       }
+    });
+  }
+
+  // ── Post-Create Side Panel (shown on /customer/{id}/view after creation) ──
+
+  function showNewCustomerPostCreatePanel(requestId) {
+    if (document.getElementById('cg-suite-new-customer-post-panel')) return;
+
+    var existing = document.getElementById('cg-suite-customer-edit-panel');
+    if (existing) existing.remove();
+
+    var panel = document.createElement('div');
+    panel.id = 'cg-suite-new-customer-post-panel';
+    panel.innerHTML =
+      '<div style="position:fixed;top:50%;right:0;transform:translateY(-50%);z-index:2147483647;' +
+        'background:#1e3a8a;color:white;padding:18px 20px;border-radius:14px 0 0 14px;' +
+        'box-shadow:-8px 8px 28px rgba(0,0,0,0.42);font-family:Inter,sans-serif;' +
+        'width:280px;min-width:240px;max-width:380px;resize:horizontal;overflow:auto;box-sizing:border-box;">' +
+        '<p style="margin:0 0 6px 0;font-weight:800;font-size:17px;">Customer created</p>' +
+        '<p style="margin:0 0 14px 0;font-size:13px;opacity:0.85;line-height:1.4;">' +
+          'You can fill in the rest of their info now on NoSpos, or just press Done and update it later from Cash EPOS.' +
+        '</p>' +
+        '<button id="cg-suite-new-customer-done" style="display:block;width:100%;padding:11px 14px;background:#facc15;color:#1e3a8a;' +
+          'border:none;border-radius:9999px;font-weight:800;cursor:pointer;font-size:14px;margin-bottom:8px;">Done</button>' +
+        '<button id="cg-suite-new-customer-cancel" style="display:block;width:100%;padding:9px 14px;background:transparent;color:#e5e7eb;' +
+          'border:1px solid rgba(248,250,252,0.4);border-radius:9999px;font-weight:600;cursor:pointer;font-size:12px;">Cancel</button>' +
+      '</div>';
+    document.body.appendChild(panel);
+
+    var doneBtn = document.getElementById('cg-suite-new-customer-done');
+    var cancelBtn = document.getElementById('cg-suite-new-customer-cancel');
+
+    doneBtn.addEventListener('click', function () {
+      doneBtn.disabled = true;
+      doneBtn.style.opacity = '0.7';
+      doneBtn.textContent = 'Returning…';
+
+      var customer = scrapeCustomerForm();
+      customer.nosposCustomerId = extractNosposCustomerIdFromPath();
+      customer.name = ((customer.forename || '') + ' ' + (customer.surname || '')).trim();
+      customer.phone = customer.mobile || customer.homePhone;
+      customer.address = [customer.address1, customer.address2, customer.town, customer.county, customer.postcode].filter(Boolean).join(', ');
+
+      profilePictureToDataUrl(customer.profilePicture).then(function (embedded) {
+        customer.profilePicture = embedded || null;
+        chrome.runtime.sendMessage({
+          type: 'NOSPOS_CUSTOMER_DONE',
+          requestId: requestId,
+          cancelled: false,
+          customer: customer,
+          changes: [],
+          newCustomer: true,
+        }).catch(function () {});
+        panel.remove();
+      });
+    });
+
+    cancelBtn.addEventListener('click', function () {
+      chrome.runtime.sendMessage({ type: 'NOSPOS_CUSTOMER_DONE', requestId: requestId, cancelled: true }).catch(function () {});
+      panel.remove();
     });
   }
 
@@ -1611,6 +1159,8 @@
         onStockEditPageLoad();
       } else if (isOnCustomerDetailPage()) {
         onCustomerDetailPageLoad();
+      } else if (isOnCustomerCreatePage()) {
+        onCustomerCreatePageLoad();
       } else if (isOnCustomerSearchPage()) {
         onCustomerSearchPageLoad();
       } else if (isOnStockCategoryIndexPage()) {

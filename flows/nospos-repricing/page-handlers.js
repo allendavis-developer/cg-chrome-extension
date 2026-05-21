@@ -39,6 +39,15 @@ async function handleNosposPageReady(message, sender) {
       console.log('[CG Suite] NOSPOS_PAGE_READY – re-navigating to /customers after post-login redirect', { requestId });
       return;
     }
+    if (entry.type === 'openNosposNewCustomerCreate' || entry.type === 'openNosposNewCustomerCreateWaiting') {
+      // Customer-create flow. If the post-login bounce dropped us off the create
+      // page, re-navigate. Flip to Waiting so we don't loop on re-entry.
+      pending[requestId] = { ...entry, type: 'openNosposNewCustomerCreateWaiting' };
+      await setPending(pending);
+      await chrome.tabs.update(tabId, { url: 'https://nospos.com/customers/create' });
+      console.log('[CG Suite] NOSPOS_PAGE_READY – new-customer create: navigating to /customers/create', { requestId });
+      return;
+    }
     if (entry.type === 'openNosposSiteOnly') {
       await runNosposDataImportAfterLogin({
         tabId,
@@ -275,6 +284,8 @@ async function handleNosposLoginRequired(message, sender) {
       entry.type !== 'openNosposCustomerIntake' &&
       entry.type !== 'openNosposCustomerIntakeWaiting' &&
       entry.type !== 'openNosposCustomerIntakeSaveFailed' &&
+      entry.type !== 'openNosposNewCustomerCreate' &&
+      entry.type !== 'openNosposNewCustomerCreateWaiting' &&
       entry.type !== 'openNosposSiteOnly' &&
       entry.type !== 'openNosposSiteForFields' &&
       entry.type !== 'openNosposSiteForCategoryFields' &&
@@ -305,15 +316,43 @@ async function handleNosposCustomerSearchReady(message, sender) {
   return { ok: false };
 }
 
+async function handleNosposCustomerCreateReady(message, sender) {
+  const tabId = sender.tab?.id;
+  if (tabId == null) return { ok: false };
+
+  const pending = await getPending();
+  for (const [requestId, entry] of Object.entries(pending)) {
+    if (entry.listingTabId !== tabId) continue;
+    if (entry.type === 'openNosposNewCustomerCreate' || entry.type === 'openNosposNewCustomerCreateWaiting') {
+      // First time we see /customers/create, lock in the waiting state so the
+      // post-login NOSPOS_PAGE_READY handler doesn't kick us off.
+      if (entry.type !== 'openNosposNewCustomerCreateWaiting') {
+        pending[requestId] = { ...entry, type: 'openNosposNewCustomerCreateWaiting' };
+        await setPending(pending);
+      }
+      console.log('[CG Suite] NOSPOS_CUSTOMER_CREATE_READY – returning requestId', { requestId });
+      return { ok: true, requestId };
+    }
+  }
+  return { ok: false };
+}
+
 async function handleNosposCustomerDetailReady(message, sender) {
   const tabId = sender.tab?.id;
   if (tabId == null) return { ok: false };
 
   const pending = await getPending();
   for (const [requestId, entry] of Object.entries(pending)) {
-    if (entry.listingTabId === tabId && entry.type === 'openNosposCustomerIntakeWaiting') {
-      console.log('[CG Suite] NOSPOS_CUSTOMER_DETAIL_READY – user on customer detail page, returning requestId', { requestId });
-      return { ok: true, requestId };
+    if (entry.listingTabId !== tabId) continue;
+    if (entry.type === 'openNosposCustomerIntakeWaiting') {
+      console.log('[CG Suite] NOSPOS_CUSTOMER_DETAIL_READY – edit flow, returning requestId', { requestId });
+      return { ok: true, requestId, flow: 'edit' };
+    }
+    if (entry.type === 'openNosposNewCustomerCreate' || entry.type === 'openNosposNewCustomerCreateWaiting') {
+      // The user submitted the create form and NoSpos redirected to the new
+      // customer's /view page. Show the post-create confirmation panel.
+      console.log('[CG Suite] NOSPOS_CUSTOMER_DETAIL_READY – post-create, returning requestId', { requestId });
+      return { ok: true, requestId, flow: 'newCreate' };
     }
   }
   return { ok: false };

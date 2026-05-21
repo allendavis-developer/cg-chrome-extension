@@ -18,6 +18,8 @@ async function handleBridgeAction_cancelRequest({ requestId, appTabId, payload }
       entry.type !== 'openNospos' &&
       entry.type !== 'openNosposCustomerIntake' &&
       entry.type !== 'openNosposCustomerIntakeWaiting' &&
+      entry.type !== 'openNosposNewCustomerCreate' &&
+      entry.type !== 'openNosposNewCustomerCreateWaiting' &&
       entry.type !== 'openNosposSiteOnly' &&
       entry.type !== 'openNosposSiteForFields' &&
       entry.type !== 'openNosposSiteForCategoryFields' &&

@@ -75,6 +75,7 @@ importScripts(
   'flows/bridge/actions/open-jewellery-scrap-prices.js',
   'flows/bridge/actions/open-nospos-and-wait.js',
   'flows/bridge/actions/open-nospos-for-customer-intake.js',
+  'flows/bridge/actions/open-nospos-for-new-customer.js',
   'flows/bridge/actions/open-nospos-new-agreement-create-background.js',
   'flows/bridge/actions/open-nospos-site-for-category-fields-bulk.js',
   'flows/bridge/actions/open-nospos-site-for-category-fields.js',

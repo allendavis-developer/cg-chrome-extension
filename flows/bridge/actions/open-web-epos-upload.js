@@ -2,6 +2,13 @@
  * Open the Web EPOS upload worker tab (minimized).
  * Guard: original action required appTabId — dispatcher provides it when present.
  *
+ * Pre-flight: although this opens a Web EPOS tab (not NosPos), the upload
+ * session scrapes NosPos stock-edit pages for cost/retail/qty per item — so
+ * the operator must be on the same NosPos shop as Cash EPOS before we start.
+ * We do the same `nosposCheckLoginAndShop` probe used everywhere else; if it
+ * fails the page promise is resolved with the failure (deferred-action path)
+ * and no Web EPOS tab is opened.
+ *
  * Dispatched from flows/bridge/forward.js via the BRIDGE_ACTIONS registry.
  */
 async function handleBridgeAction_openWebEposUpload({ requestId, appTabId, payload }) {
@@ -10,6 +17,23 @@ async function handleBridgeAction_openWebEposUpload({ requestId, appTabId, paylo
   if (appTabId == null) {
     logUpload('openWebEposUpload', 'error', { reason: 'no-app-tab' }, 'No app tab');
     return { ok: false, error: 'No app tab' };
+  }
+
+  const expectedCgShopName = payload?.expectedCgShopName || '';
+  const preflight = await nosposCheckLoginAndShop('https://nospos.com/customers', expectedCgShopName);
+  if (!preflight.ok) {
+    logUpload('openWebEposUpload', 'preflight-failed', {
+      loginRequired: !!preflight.loginRequired,
+      shopMismatch: !!preflight.shopMismatch,
+      nosposShop: preflight.nosposShop || null,
+      expectedCgShop: preflight.expectedCgShop || null,
+    });
+    chrome.tabs.sendMessage(appTabId, {
+      type: 'EXTENSION_RESPONSE_TO_PAGE',
+      requestId,
+      response: preflight,
+    }).catch(() => {});
+    return preflight;
   }
 
   const { tabId: webeposTabId } = await ensureWebEposUploadWorkerTabOpen(

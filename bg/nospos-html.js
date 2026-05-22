@@ -5,7 +5,9 @@
  *          getStockNameFromEditHtml, parseNosposSearchResults,
  *          parseNosposStockEditResult, parseNosposPaginationNextHref,
  *          normalizeNosposStockEditUrl, parseNosposStockEditPageDetails,
- *          parseNosposStockEditPageChangeLog, handleFetchAddressSuggestions
+ *          parseNosposStockEditPageChangeLog, handleFetchAddressSuggestions,
+ *          parseNosposBranchName, normalizeCgShopName, nosposShopMatchesCgShop,
+ *          nosposCheckLoginAndShop
  */
 
 var NOSPOS_HTML_FETCH_HEADERS = {
@@ -336,6 +338,72 @@ function parseNosposStockEditResult(html, finalUrl) {
     retailPrice: '',
     quantity: ''
   }];
+}
+
+/**
+ * Pull the currently-selected branch name out of any NosPos page's navbar.
+ * The branch selector is the disabled anchor whose href targets the
+ * `#select-branch-modal` — its inner `<span>` holds e.g. "CG Warrington".
+ * Returns '' if the navbar isn't present (e.g. fetched a non-app page).
+ */
+function parseNosposBranchName(html) {
+  if (!html) return '';
+  var anchorRe = /<a\b[^>]*href="#select-branch-modal"[^>]*>([\s\S]*?)<\/a>/i;
+  var anchor = html.match(anchorRe);
+  if (!anchor) return '';
+  var spanMatch = anchor[1].match(/<span\b[^>]*>([\s\S]*?)<\/span>/i);
+  if (!spanMatch) return '';
+  return decodeNosposHtmlText(spanMatch[1].replace(/<[^>]*>/g, ' '));
+}
+
+/**
+ * Canonical form for comparing a CG shop label across systems. Strips a
+ * leading or trailing "cg" token, collapses whitespace, lowercases. So
+ * "CG Warrington" == "Warrington" == "warrington cg". Punctuation other
+ * than spaces is left alone because real shop names don't carry any.
+ */
+function normalizeCgShopName(name) {
+  var s = String(name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  if (s.indexOf('cg ') === 0) s = s.slice(3).trim();
+  if (s.length > 3 && s.lastIndexOf(' cg') === s.length - 3) s = s.slice(0, -3).trim();
+  return s;
+}
+
+function nosposShopMatchesCgShop(nosposShop, cgShop) {
+  var a = normalizeCgShopName(nosposShop);
+  var b = normalizeCgShopName(cgShop);
+  if (!a || !b) return false;
+  return a === b;
+}
+
+/**
+ * One-shot credentialed fetch that combines NosPos's login redirect detection
+ * with the navbar branch-name parse. Used as a pre-flight before any flow
+ * that opens NosPos (customer intake, new-customer create, park agreement) so
+ * the user is bounced with a clear message when they're either signed out or
+ * looking at the wrong shop on NosPos.
+ *
+ * `expectedCgShopName` is the human-readable CG store name (e.g. "CG Toxteth").
+ * Pass empty/null to skip the shop comparison (e.g. when the extension is
+ * older than the website and the website didn't send one).
+ *
+ * @param {string} url Absolute NosPos URL to probe.
+ * @param {string|null|undefined} expectedCgShopName
+ * @returns {Promise<{ ok: true, nosposShop: string }
+ *   | { ok: false, loginRequired: true }
+ *   | { ok: false, shopMismatch: true, nosposShop: string, expectedCgShop: string }
+ *   | { ok: false, error: string }>}
+ */
+async function nosposCheckLoginAndShop(url, expectedCgShopName) {
+  var fetched = await nosposCredentialedHtmlFetch(url);
+  if (!fetched.ok) return fetched;
+  var nosposShop = parseNosposBranchName(fetched.html);
+  var expected = String(expectedCgShopName || '').trim();
+  if (expected && nosposShop && !nosposShopMatchesCgShop(nosposShop, expected)) {
+    return { ok: false, shopMismatch: true, nosposShop: nosposShop, expectedCgShop: expected };
+  }
+  return { ok: true, nosposShop: nosposShop };
 }
 
 async function handleFetchAddressSuggestions(message) {

@@ -2,10 +2,31 @@
  * Open NosPos for a repricing flow and wait for the user / barcode queue.
  * Guard: original action required appTabId — dispatcher provides it when present.
  *
+ * Pre-flight: credentialed fetch of `https://nospos.com/customers` to verify
+ * the operator is signed in AND on the same shop as Cash EPOS — same pattern
+ * as the customer-intake / park-agreement flows. Failure short-circuits before
+ * any tab is opened or any repricing state is wiped.
+ *
+ * NOTE on response delivery: this action is in content-bridge.js's deferred
+ * list — the page promise gets resolved by a later `EXTENSION_RESPONSE_TO_PAGE`
+ * after the barcode queue finishes. When the pre-flight bails we have to post
+ * the failure to the app tab ourselves; the bridge ignores our return value.
+ *
  * Dispatched from flows/bridge/forward.js via the BRIDGE_ACTIONS registry.
  */
 async function handleBridgeAction_openNosposAndWait({ requestId, appTabId, payload }) {
   if (appTabId == null) return { ok: false, error: 'No app tab' };
+
+  const expectedCgShopName = payload?.expectedCgShopName || '';
+  const preflight = await nosposCheckLoginAndShop('https://nospos.com/customers', expectedCgShopName);
+  if (!preflight.ok) {
+    chrome.tabs.sendMessage(appTabId, {
+      type: 'EXTENSION_RESPONSE_TO_PAGE',
+      requestId,
+      response: preflight,
+    }).catch(() => {});
+    return preflight;
+  }
 
   const url = 'https://nospos.com';
   await clearNosposRepricingState();

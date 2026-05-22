@@ -1,14 +1,20 @@
 /**
- * Check whether a NosPos customer already has an in-progress buying session.
+ * Check whether a NosPos customer already has an in-progress buying session,
+ * and verify the operator is signed into the same shop on NosPos as they are
+ * on Cash EPOS.
  *
- * Credentialed HEAD-style fetch of `/customer/{id}/buying`; we don't read the
- * body — we just need NosPos's login-redirect signal to confirm the user is
- * signed in before park flow opens any tabs.
+ * Credentialed fetch of `/customer/{id}/buying`. We read the body now (rather
+ * than cancelling) so we can extract the navbar branch label and compare it
+ * to the expected CG shop name passed in by the website. Three negative
+ * outcomes the caller can act on:
+ *   - `{ ok: false, loginRequired: true }`  — NosPos redirected to login.
+ *   - `{ ok: false, shopMismatch: true, nosposShop, expectedCgShop }`
+ *   - `{ ok: false, error: '...' }`         — timeout / network / unparseable.
  *
  * Dispatched from flows/bridge/forward.js via the BRIDGE_ACTIONS registry.
  */
 
-async function nosposFetchCustomerBuyingSession(customerId, sessionCheckMs = 12000) {
+async function nosposFetchCustomerBuyingSession(customerId, expectedCgShopName, sessionCheckMs = 12000) {
   const id = parseInt(String(customerId ?? '').trim(), 10);
   if (!Number.isFinite(id) || id <= 0) {
     return { ok: false, error: 'Invalid NosPos customer id' };
@@ -35,14 +41,34 @@ async function nosposFetchCustomerBuyingSession(customerId, sessionCheckMs = 120
   }
   clearTimeout(timer);
   const finalUrl = response.url || '';
-  try { await response.body?.cancel?.(); } catch (_) { /* ignore */ }
   if (nosposHtmlFetchIndicatesNotLoggedIn(response, finalUrl)) {
+    try { await response.body?.cancel?.(); } catch (_) { /* ignore */ }
     return { ok: false, loginRequired: true };
   }
-  return { ok: true, customerId: id };
+  let html;
+  try {
+    html = await response.text();
+  } catch (e) {
+    return { ok: false, error: e?.message || 'Could not read NosPos response' };
+  }
+  const nosposShop = parseNosposBranchName(html);
+  const expected = String(expectedCgShopName || '').trim();
+  if (expected && nosposShop && !nosposShopMatchesCgShop(nosposShop, expected)) {
+    return {
+      ok: false,
+      shopMismatch: true,
+      nosposShop,
+      expectedCgShop: expected,
+    };
+  }
+  return { ok: true, customerId: id, nosposShop };
 }
 
 async function handleBridgeAction_checkNosposCustomerBuyingSession({ requestId, appTabId, payload }) {
-  logPark('handleBridgeForward', 'enter', { action: 'checkNosposCustomerBuyingSession', nosposCustomerId: payload.nosposCustomerId }, 'Step 1: checking NoSpos customer buying session');
-  return nosposFetchCustomerBuyingSession(payload.nosposCustomerId);
+  logPark('handleBridgeForward', 'enter', {
+    action: 'checkNosposCustomerBuyingSession',
+    nosposCustomerId: payload.nosposCustomerId,
+    expectedCgShopName: payload.expectedCgShopName || null,
+  }, 'Step 1: checking NoSpos customer buying session + shop match');
+  return nosposFetchCustomerBuyingSession(payload.nosposCustomerId, payload.expectedCgShopName);
 }

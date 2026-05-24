@@ -67,6 +67,11 @@ async function activateNosposParkAgreementUi(tabId, appTabId) {
 
 async function clearNosposParkAgreementUiLock(options = {}) {
   const focusApp = options.focusApp !== false;
+  // When the caller (login-required / shop-mismatch failure branches) wants
+  // the registered NosPos park tab gone too — otherwise a lingering tab from
+  // a prior failed run stays open and the next preflight runs in the wrong
+  // shop context. Default false keeps existing callers' behaviour.
+  const closeTab = options.closeTab === true;
   const data = await chrome.storage.session.get(NOSPOS_PARK_UI_STORAGE_KEY);
   const lock = data[NOSPOS_PARK_UI_STORAGE_KEY];
   if (!lock || !lock.active) return;
@@ -74,6 +79,13 @@ async function clearNosposParkAgreementUiLock(options = {}) {
   if (lock.tabId != null) {
     unregisterNosposParkTab(lock.tabId);
     await sendNosposParkOverlayToTab(lock.tabId, false);
+    if (closeTab) {
+      try {
+        await chrome.tabs.remove(lock.tabId);
+      } catch (_) {
+        /* already closed */
+      }
+    }
   }
   if (focusApp && lock.appTabId != null) {
     await focusAppTab(lock.appTabId);

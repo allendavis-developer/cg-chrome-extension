@@ -396,20 +396,39 @@ function nosposLabelContainsMatch(nosposShop, expectedShopMatch) {
  * Prefers the substring `expectedShopMatch` (new path, from Location.match);
  * falls back to the legacy strict-normalised compare on `expectedCgShopName`
  * for old website builds that don't send a match string yet. Returns null
- * when there's no disagreement (or not enough info to call one) — caller
- * treats null as "pass".
+ * only when the caller asked for no check (both expectations empty) OR the
+ * label positively matches an expectation. Caller treats null as "pass".
+ *
+ * Fail-closed when the caller wants a check but we couldn't read the navbar
+ * (`label === ''`). This used to silently return null and let the buying /
+ * park-agreement flow proceed against the wrong shop's NosPos whenever the
+ * fetched page lacked the `#select-branch-modal` anchor — e.g. when NosPos
+ * served a customer-not-found page for a customer that lives on another
+ * shop, or when the navbar markup shifted. The fix treats "couldn't verify"
+ * as a mismatch so the gate never evaporates; the caller surfaces a clear
+ * "reload nospos.com on the right shop" message.
  */
 function nosposShopMismatchReason(nosposShop, expectedCgShopName, expectedShopMatch) {
   var label = String(nosposShop || '').trim();
   var matchStr = String(expectedShopMatch || '').trim();
+  var expectedName = String(expectedCgShopName || '').trim();
+
+  // No expectations supplied → caller intentionally skipped the shop check.
+  if (!matchStr && !expectedName) return null;
+
+  // Caller wanted a check but the navbar didn't parse → fail closed.
+  if (!label) {
+    return { expectedCgShop: expectedName || matchStr };
+  }
+
   if (matchStr) {
-    if (label && !nosposLabelContainsMatch(label, matchStr)) {
-      return { expectedCgShop: String(expectedCgShopName || '').trim() || matchStr };
+    if (!nosposLabelContainsMatch(label, matchStr)) {
+      return { expectedCgShop: expectedName || matchStr };
     }
     return null;
   }
-  var expectedName = String(expectedCgShopName || '').trim();
-  if (expectedName && label && !nosposShopMatchesCgShop(label, expectedName)) {
+
+  if (!nosposShopMatchesCgShop(label, expectedName)) {
     return { expectedCgShop: expectedName };
   }
   return null;

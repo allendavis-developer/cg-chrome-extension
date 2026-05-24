@@ -19,7 +19,8 @@
  */
 async function handleBridgeAction_openNosposForNewCustomer({ requestId, appTabId, payload }) {
   const expectedCgShopName = payload?.expectedCgShopName || '';
-  const preflight = await nosposCheckLoginAndShop('https://nospos.com/customers', expectedCgShopName);
+  const expectedShopMatch = payload?.expectedShopMatch || '';
+  const preflight = await nosposCheckLoginAndShop('https://nospos.com/customers', expectedCgShopName, expectedShopMatch);
   if (!preflight.ok) {
     if (appTabId != null) {
       chrome.tabs.sendMessage(appTabId, {

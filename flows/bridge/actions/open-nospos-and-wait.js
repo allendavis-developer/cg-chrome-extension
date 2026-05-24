@@ -18,7 +18,8 @@ async function handleBridgeAction_openNosposAndWait({ requestId, appTabId, paylo
   if (appTabId == null) return { ok: false, error: 'No app tab' };
 
   const expectedCgShopName = payload?.expectedCgShopName || '';
-  const preflight = await nosposCheckLoginAndShop('https://nospos.com/customers', expectedCgShopName);
+  const expectedShopMatch = payload?.expectedShopMatch || '';
+  const preflight = await nosposCheckLoginAndShop('https://nospos.com/customers', expectedCgShopName, expectedShopMatch);
   if (!preflight.ok) {
     chrome.tabs.sendMessage(appTabId, {
       type: 'EXTENSION_RESPONSE_TO_PAGE',

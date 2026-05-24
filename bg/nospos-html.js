@@ -378,30 +378,75 @@ function nosposShopMatchesCgShop(nosposShop, cgShop) {
 }
 
 /**
+ * Substring check used by the new (preferred) shop-match path. NosPos's navbar
+ * label varies between branches ("CG Toxteth", "Toxteth", "Liverpool -
+ * Toxteth"); rather than try to canonicalise every variant, the backend
+ * stores a distinctive substring per branch (`Location.match`) and we just
+ * test case-insensitively that it appears in the navbar label.
+ */
+function nosposLabelContainsMatch(nosposShop, expectedShopMatch) {
+  var label = String(nosposShop || '').toLowerCase();
+  var needle = String(expectedShopMatch || '').toLowerCase().trim();
+  if (!label || !needle) return false;
+  return label.indexOf(needle) !== -1;
+}
+
+/**
+ * Decide whether the navbar label disagrees with what the website expects.
+ * Prefers the substring `expectedShopMatch` (new path, from Location.match);
+ * falls back to the legacy strict-normalised compare on `expectedCgShopName`
+ * for old website builds that don't send a match string yet. Returns null
+ * when there's no disagreement (or not enough info to call one) — caller
+ * treats null as "pass".
+ */
+function nosposShopMismatchReason(nosposShop, expectedCgShopName, expectedShopMatch) {
+  var label = String(nosposShop || '').trim();
+  var matchStr = String(expectedShopMatch || '').trim();
+  if (matchStr) {
+    if (label && !nosposLabelContainsMatch(label, matchStr)) {
+      return { expectedCgShop: String(expectedCgShopName || '').trim() || matchStr };
+    }
+    return null;
+  }
+  var expectedName = String(expectedCgShopName || '').trim();
+  if (expectedName && label && !nosposShopMatchesCgShop(label, expectedName)) {
+    return { expectedCgShop: expectedName };
+  }
+  return null;
+}
+
+/**
  * One-shot credentialed fetch that combines NosPos's login redirect detection
  * with the navbar branch-name parse. Used as a pre-flight before any flow
  * that opens NosPos (customer intake, new-customer create, park agreement) so
  * the user is bounced with a clear message when they're either signed out or
  * looking at the wrong shop on NosPos.
  *
- * `expectedCgShopName` is the human-readable CG store name (e.g. "CG Toxteth").
- * Pass empty/null to skip the shop comparison (e.g. when the extension is
- * older than the website and the website didn't send one).
+ * Two shop-comparison paths:
+ *   - `expectedShopMatch` (preferred) — distinctive substring from the
+ *     backend's `Location.match`; we require it appears (case-insensitively)
+ *     in the NosPos navbar label. This is what the current website sends.
+ *   - `expectedCgShopName` (legacy fallback) — human-readable CG store name
+ *     (e.g. "CG Toxteth") compared via strict normalised equality. Used
+ *     when a website older than this extension build is the caller.
+ *
+ * Pass both empty/null to skip the shop comparison entirely.
  *
  * @param {string} url Absolute NosPos URL to probe.
  * @param {string|null|undefined} expectedCgShopName
+ * @param {string|null|undefined} expectedShopMatch
  * @returns {Promise<{ ok: true, nosposShop: string }
  *   | { ok: false, loginRequired: true }
  *   | { ok: false, shopMismatch: true, nosposShop: string, expectedCgShop: string }
  *   | { ok: false, error: string }>}
  */
-async function nosposCheckLoginAndShop(url, expectedCgShopName) {
+async function nosposCheckLoginAndShop(url, expectedCgShopName, expectedShopMatch) {
   var fetched = await nosposCredentialedHtmlFetch(url);
   if (!fetched.ok) return fetched;
   var nosposShop = parseNosposBranchName(fetched.html);
-  var expected = String(expectedCgShopName || '').trim();
-  if (expected && nosposShop && !nosposShopMatchesCgShop(nosposShop, expected)) {
-    return { ok: false, shopMismatch: true, nosposShop: nosposShop, expectedCgShop: expected };
+  var mismatch = nosposShopMismatchReason(nosposShop, expectedCgShopName, expectedShopMatch);
+  if (mismatch) {
+    return { ok: false, shopMismatch: true, nosposShop: nosposShop, expectedCgShop: mismatch.expectedCgShop };
   }
   return { ok: true, nosposShop: nosposShop };
 }

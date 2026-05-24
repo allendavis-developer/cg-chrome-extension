@@ -20,7 +20,8 @@ async function handleBridgeAction_openWebEposUpload({ requestId, appTabId, paylo
   }
 
   const expectedCgShopName = payload?.expectedCgShopName || '';
-  const preflight = await nosposCheckLoginAndShop('https://nospos.com/customers', expectedCgShopName);
+  const expectedShopMatch = payload?.expectedShopMatch || '';
+  const preflight = await nosposCheckLoginAndShop('https://nospos.com/customers', expectedCgShopName, expectedShopMatch);
   if (!preflight.ok) {
     logUpload('openWebEposUpload', 'preflight-failed', {
       loginRequired: !!preflight.loginRequired,

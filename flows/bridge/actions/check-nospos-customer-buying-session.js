@@ -14,7 +14,7 @@
  * Dispatched from flows/bridge/forward.js via the BRIDGE_ACTIONS registry.
  */
 
-async function nosposFetchCustomerBuyingSession(customerId, expectedCgShopName, sessionCheckMs = 12000) {
+async function nosposFetchCustomerBuyingSession(customerId, expectedCgShopName, expectedShopMatch, sessionCheckMs = 12000) {
   const id = parseInt(String(customerId ?? '').trim(), 10);
   if (!Number.isFinite(id) || id <= 0) {
     return { ok: false, error: 'Invalid NosPos customer id' };
@@ -52,13 +52,13 @@ async function nosposFetchCustomerBuyingSession(customerId, expectedCgShopName, 
     return { ok: false, error: e?.message || 'Could not read NosPos response' };
   }
   const nosposShop = parseNosposBranchName(html);
-  const expected = String(expectedCgShopName || '').trim();
-  if (expected && nosposShop && !nosposShopMatchesCgShop(nosposShop, expected)) {
+  const mismatch = nosposShopMismatchReason(nosposShop, expectedCgShopName, expectedShopMatch);
+  if (mismatch) {
     return {
       ok: false,
       shopMismatch: true,
       nosposShop,
-      expectedCgShop: expected,
+      expectedCgShop: mismatch.expectedCgShop,
     };
   }
   return { ok: true, customerId: id, nosposShop };
@@ -69,6 +69,11 @@ async function handleBridgeAction_checkNosposCustomerBuyingSession({ requestId, 
     action: 'checkNosposCustomerBuyingSession',
     nosposCustomerId: payload.nosposCustomerId,
     expectedCgShopName: payload.expectedCgShopName || null,
+    expectedShopMatch: payload.expectedShopMatch || null,
   }, 'Step 1: checking NoSpos customer buying session + shop match');
-  return nosposFetchCustomerBuyingSession(payload.nosposCustomerId, payload.expectedCgShopName);
+  return nosposFetchCustomerBuyingSession(
+    payload.nosposCustomerId,
+    payload.expectedCgShopName,
+    payload.expectedShopMatch,
+  );
 }

@@ -3,15 +3,45 @@
  * Loaded first so subsequent files can reference them.
  */
 
-const NOSPOS_RELOAD_WAIT_MS = 20000;
+// Hard safety cap for a genuine navigation/reload. waitForAgreementItemsPageReload bails out
+// early (after NOSPOS_NO_RELOAD_GRACE_MS) when NosPos updates in place and no reload is coming,
+// and otherwise resolves the instant the reload completes — so this cap is only ever paid for a
+// real reload that is pathologically slow. Kept generous so a slow reload doesn't error out.
+const NOSPOS_RELOAD_WAIT_MS = 12000;
+/** If a navigation hasn't STARTED within this window after an action, NosPos updated in place — stop waiting. */
+const NOSPOS_NO_RELOAD_GRACE_MS = 500;
+/** Fallback rows-per-page for NosPos' agreement items pager (?items-page=N). NosPos instances
+ *  don't all use the same page size (observed: 11 on one tenant, not 20), so this is only the
+ *  seed value — the real size is detected at runtime from the live pager and cached per tab in
+ *  `nosposItemsPerPageByTabId`. Read it via {@link getNosposItemsPerPage}, never directly. */
+const NOSPOS_ITEMS_PER_PAGE = 20;
+/** Per-tab detected rows-per-page, learned the first time the agreement spills onto a 2nd page
+ *  (a full, non-last page's row count IS the page size). Falls back to NOSPOS_ITEMS_PER_PAGE. */
+const nosposItemsPerPageByTabId = new Map();
+/** After the category reload settles, wait this long before filling the line's fields. */
+const NOSPOS_POST_CATEGORY_FILL_DELAY_MS = 400;
 /** Delay before Actions -> Delete Agreement / Park Agreement clicks to reduce rate-limit spikes. */
-const NOSPOS_ACTION_POST_DELAY_MS = 1200;
-/** Rate-limit guard before clicking Add item (does not affect item-form filling). */
-const NOSPOS_ADD_ITEM_CLICK_DELAY_MS = 700;
+const NOSPOS_ACTION_POST_DELAY_MS = 600;
+/** Rate-limit guard before clicking Add item (does not affect item-form filling). Moderate: enough
+ *  spacing to keep NosPos from throttling on a long agreement, without the old 3s tax. */
+const NOSPOS_ADD_ITEM_CLICK_DELAY_MS = 800;
+/** How long to poll for the new row after Add before handing off to the recovery reload. Doesn't
+ *  need to be huge anymore: if the row was created but the render stalled past this, the recovery
+ *  reload finds it (success); if it wasn't created, the recovery confirms the drop and we cool
+ *  down + retry. So this is just the "give the normal render a chance" window. */
+const NOSPOS_ADD_ROW_WAIT_MS = 20000;
+/** When the new row hasn't appeared by the end of the post-Add wait, re-fetch (GET) and recount
+ *  this many times, with growing backoff, BEFORE concluding the Add was dropped. NosPos throttles
+ *  hard around items ~10-12, and a successful Add's row can persist/render after our first reload —
+ *  patient re-reads find it instead of falsely declaring it missing and re-Adding (a duplicate
+ *  risk). Each re-read is a GET, never a POST, so the rechecks themselves can never duplicate. */
+const NOSPOS_ADD_ROW_RECOVERY_RECHECKS = 4;
 /** Rate-limit guard before sending category set (does not affect item-form filling). */
-const NOSPOS_SET_CATEGORY_DELAY_MS = 700;
-/** Global park-flow pacing delay applied before extension-to-tab steps. */
-const NOSPOS_PARK_GLOBAL_STEP_DELAY_MS = 450;
+const NOSPOS_SET_CATEGORY_DELAY_MS = 150;
+/** Global park-flow pacing delay applied before extension-to-tab steps. Small, just enough to
+ *  keep from machine-gunning NosPos on a long agreement (which is what tips it into the slow
+ *  throttled reloads that blow the Add cap). The POST actions keep their own larger guards. */
+const NOSPOS_PARK_GLOBAL_STEP_DELAY_MS = 100;
 /** If NosPos returns 429 page, wait this long then reload. */
 const NOSPOS_429_RELOAD_DELAY_MS = 4000;
 /** After a 429 reload completes, sleep at least this long before retrying the save. */
@@ -20,7 +50,26 @@ const NOSPOS_RATELIMIT_RETRY_BACKOFF_MIN_MS = 1500;
 const NOSPOS_RATELIMIT_RETRY_BACKOFF_JITTER_MS = 2000;
 /** Hard cap on save attempts per item before giving up — prevents endless retry loops. */
 const NOSPOS_RATELIMIT_MAX_ATTEMPTS = 3;
+/** Max Add attempts per row (the first try plus retries after a confirmed-dropped Add). */
+const NOSPOS_ADD_MAX_ATTEMPTS = 4;
+/** After an Add is confirmed dropped (row never created, throttled), wait this long for NosPos's
+ *  POST throttle to reset before re-clicking Add. Re-adding is safe here: the reload proved no
+ *  row was created, so there's no duplicate risk. */
+const NOSPOS_ADD_DROP_COOLDOWN_MS = 15000;
+/** Once a drop happens, pace ALL subsequent Adds wider by this step (per drop) so we stop
+ *  hammering NosPos into the throttle. Decays on a clean Add. */
+const NOSPOS_ADD_COOLDOWN_STEP_MS = 4000;
+/** Ceiling for the adaptive per-Add pacing. */
+const NOSPOS_ADD_COOLDOWN_MAX_MS = 16000;
+/** Adaptive extra pre-Add pacing, grown by confirmed drops and decayed by clean Adds. */
+let nosposAddCooldownMs = 0;
 const nospos429LastRecoveryAtByTabId = new Map();
+/** Last time the 429 probe ran and found NO 429, per tab. Lets us skip the (expensive on a
+ *  backgrounded tab) executeScript probe during rapid message bursts. */
+const nospos429LastCleanProbeAtByTabId = new Map();
+/** How long a clean 429 probe stays valid before we re-probe (ms). Short enough that a 429 that
+ *  appears during a long post-Add wait is still caught within a couple seconds. */
+const NOSPOS_429_PROBE_CACHE_MS = 2500;
 
 /**
  * TEST ONLY: when true, Park Agreement intentionally fails after 2 included items.

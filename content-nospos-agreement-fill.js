@@ -149,6 +149,108 @@
     return listCategorySelects().length;
   }
 
+  /**
+   * NosPos splits an agreement's items across pages (20 per page) once it grows past one
+   * page — the screenshot pager («1 2») is a stock Yii2 LinkPager (`ul.pagination`). Each
+   * page only renders its own rows, so the flat `listCategorySelects()` count/index is
+   * page-local. These helpers let the park flow walk pages so items 21+ are reachable.
+   */
+  function findAgreementPagerEl() {
+    const form = itemsFormRootEl();
+    const scope = form || document;
+    return scope.querySelector('ul.pagination') || document.querySelector('ul.pagination') || null;
+  }
+
+  /**
+   * Page number a pager <a> points at: prefer the page query arg, else its visible text.
+   * NosPos' agreement items pager uses `items-page=N` (not Yii2's default `page=N`).
+   */
+  function pageNumberFromPagerLink(a) {
+    if (!a) return null;
+    const href = a.getAttribute('href') || a.href || '';
+    const m = String(href).match(/[?&](?:items-)?page=(\d+)/i);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    const t = parseInt(String(a.textContent || '').trim(), 10);
+    return Number.isFinite(t) && t > 0 ? t : null;
+  }
+
+  /** The query param NosPos uses to page the items list (read off a real pager link; default items-page). */
+  function agreementPageParamName() {
+    const ul = findAgreementPagerEl();
+    if (ul) {
+      const links = Array.from(ul.querySelectorAll('li a'));
+      for (const a of links) {
+        const href = a.getAttribute('href') || a.href || '';
+        const m = String(href).match(/[?&]((?:items-)?page)=\d+/i);
+        if (m) return m[1];
+      }
+    }
+    return 'items-page';
+  }
+
+  /**
+   * Read pager state for the items page.
+   * @returns {{ ok: true, hasPager: boolean, currentPage: number, lastPage: number, count: number }}
+   */
+  function runReadAgreementPager() {
+    const count = agreementItemLineCount();
+    const ul = findAgreementPagerEl();
+    if (!ul) {
+      return { ok: true, hasPager: false, currentPage: 1, lastPage: 1, count };
+    }
+    let currentPage = 1;
+    let lastPage = 1;
+    const lis = Array.from(ul.querySelectorAll('li'));
+    for (const li of lis) {
+      const a = li.querySelector('a');
+      const p = pageNumberFromPagerLink(a);
+      if (p != null && p > lastPage) lastPage = p;
+      if (li.classList && li.classList.contains('active')) {
+        const ap = p != null ? p : parseInt(String(li.textContent || '').trim(), 10);
+        if (Number.isFinite(ap) && ap > 0) currentPage = ap;
+      }
+    }
+    if (lastPage < currentPage) lastPage = currentPage;
+    return { ok: true, hasPager: true, currentPage, lastPage, count };
+  }
+
+  /**
+   * Navigate the items page to a 1-based page number. Prefers the real pager link's href
+   * (keeps NosPos' own query args); falls back to setting `?page=N` on the current URL.
+   */
+  function runNavigateAgreementToPage(pageNum) {
+    const want = Math.max(1, parseInt(String(pageNum), 10) || 1);
+    const cur = runReadAgreementPager();
+    if (cur.currentPage === want) return { ok: true, navigated: false, alreadyThere: true };
+    const ul = findAgreementPagerEl();
+    if (ul) {
+      const links = Array.from(ul.querySelectorAll('li a'));
+      for (const a of links) {
+        if (pageNumberFromPagerLink(a) === want) {
+          const href = a.href || a.getAttribute('href');
+          if (href) {
+            log('pager → navigating to page', want, href);
+            window.location.href = href;
+            return { ok: true, navigated: true };
+          }
+        }
+      }
+    }
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.delete('action');
+      u.searchParams.set(agreementPageParamName(), String(want));
+      log('pager → navigating to page (url fallback)', want, u.toString());
+      window.location.href = u.toString();
+      return { ok: true, navigated: true, viaUrl: true };
+    } catch (_) {
+      return { ok: false, error: 'Could not navigate to page ' + want };
+    }
+  }
+
   function firstItemCategorySelect() {
     const sels = listCategorySelects();
     if (sels.length) return sels[0];
@@ -282,6 +384,22 @@
         displayValue: displayForControl(el),
       };
     }
+    // Parking must always go through: if a field won't accept input (NosPos has
+    // it locked / read-only), don't fight it — leave it and tell the operator.
+    const isLocked =
+      el.disabled === true ||
+      el.readOnly === true ||
+      String(el.getAttribute && el.getAttribute('aria-disabled')).toLowerCase() === 'true';
+    if (isLocked) {
+      warn('setSelectOrInputValue: field locked (disabled/read-only)', ctx || '');
+      return {
+        ok: false,
+        note: 'NosPos field is locked (read-only) — left as-is.',
+        ...gatherControlMeta(el),
+        currentValue: readControlValue(el),
+        displayValue: displayForControl(el),
+      };
+    }
     const tag = el.tagName;
     const before = readControlValue(el);
     let note = null;
@@ -314,7 +432,7 @@
         });
         return {
           ok: false,
-          note: null,
+          note: `No matching NosPos option for “${val}” — left as-is.`,
           ...gatherControlMeta(el),
           currentValue: before,
           displayValue: displayForControl(el),
@@ -345,7 +463,12 @@
     }
     const meta = gatherControlMeta(el);
     log('set field', ctx || el.name || el.id, { before, after, wanted: val, ok });
-    if (!ok) warn('value may not have stuck (custom widget?)', ctx, { after, wanted: val });
+    if (!ok) {
+      warn('value may not have stuck (custom widget?)', ctx, { after, wanted: val });
+      // Surface it to the operator rather than silently dropping it — park
+      // continues regardless.
+      note = 'NosPos didn’t accept this value — left as-is.';
+    }
     return {
       ok,
       note,
@@ -443,6 +566,30 @@
     const c = findControlByLabel(s, 'Item description');
     if (c) return c;
     return findControlByLabel(s, 'Description');
+  }
+
+  // Merge our CG description block (the marker + any "Label: value" testing
+  // fields flagged add-to-description) into whatever is already in the NosPos
+  // item description — APPEND, never wipe. The marker identifies our block, so
+  // a re-park updates it in place rather than duplicating it, and any text the
+  // operator (or NosPos) put there is preserved.
+  function mergeCgItemDescription(existing, incoming) {
+    const inc = String(incoming || '').trim();
+    const ex = String(existing || '');
+    if (!inc) return ex.trim();
+    const m = inc.match(/\[CG-[^\]]*\]/);
+    const marker = m ? m[0] : '';
+    if (marker) {
+      const idx = ex.indexOf(marker);
+      if (idx !== -1) {
+        // Replace our prior block (marker → end) with the fresh one; keep
+        // anything that came before it.
+        const before = ex.slice(0, idx).replace(/\s+$/, '');
+        return before ? `${before} ${inc}` : inc;
+      }
+    }
+    const exTrim = ex.trim();
+    return exTrim ? `${exTrim} ${inc}` : inc;
   }
 
   function findItemDescriptionInputForLine(lineIdx) {
@@ -988,8 +1135,10 @@
 
     if (msg.itemDescription != null && String(msg.itemDescription).trim()) {
       const descInp = findItemDescriptionInputForLine(lineIdx);
-      const val = String(msg.itemDescription).trim();
+      const incoming = String(msg.itemDescription).trim();
       if (descInp) {
+        // Append to / update our block in the existing description — don't wipe.
+        const val = mergeCgItemDescription(readControlValue(descInp), incoming);
         const rDesc = setSelectOrInputValue(descInp, val, 'item_description');
         applied.itemDescription = rDesc.ok;
         fieldRows.push({
@@ -1090,6 +1239,21 @@
       const ctrl = findStockControlForLine(root, label);
       if (!ctrl) {
         warnings.push(`No control found for stock field "${label}"`);
+        fieldRows.push({
+          id: `stock:${normLabel(label)}`,
+          field: label,
+          ourValue: value,
+          nosposValue: '',
+          nosposDisplay: '',
+          note: 'NosPos field not found on the agreement — left as-is.',
+          required: false,
+          inputKind: 'text',
+          options: [],
+          step: null,
+          min: null,
+          patchKind: 'by_label',
+          fieldLabel: label,
+        });
         continue;
       }
       const r = setSelectOrInputValue(ctrl, value, `stock:"${label}"`);
@@ -1164,6 +1328,14 @@
       }
       if (msg.phase === 'count_lines') {
         sendResponse({ ok: true, count: agreementItemLineCount() });
+        return true;
+      }
+      if (msg.phase === 'read_pager') {
+        sendResponse(runReadAgreementPager());
+        return true;
+      }
+      if (msg.phase === 'nav_to_page') {
+        sendResponse(runNavigateAgreementToPage(msg.pageNum));
         return true;
       }
       if (msg.phase === 'click_add') {

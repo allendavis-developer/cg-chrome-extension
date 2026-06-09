@@ -97,14 +97,15 @@ async function clickNosposSidebarParkAgreementImpl(payload) {
 }
 
 async function clickNosposAgreementAddItem(tabId) {
-  if (NOSPOS_ADD_ITEM_CLICK_DELAY_MS > 0) {
+  const delayMs = NOSPOS_ADD_ITEM_CLICK_DELAY_MS + nosposAddCooldownMs;
+  if (delayMs > 0) {
     logPark(
       'clickNosposAgreementAddItem',
       'step',
-      { tabId, delayMs: NOSPOS_ADD_ITEM_CLICK_DELAY_MS },
+      { tabId, delayMs, baseMs: NOSPOS_ADD_ITEM_CLICK_DELAY_MS, adaptiveCooldownMs: nosposAddCooldownMs },
       'Rate-limit guard: delaying before Add click'
     );
-    await sleep(NOSPOS_ADD_ITEM_CLICK_DELAY_MS);
+    await sleep(delayMs);
   }
   return sendParkMessageToTabWithAbort(
     tabId,
@@ -117,7 +118,7 @@ async function clickNosposAgreementAddItem(tabId) {
 /** After clicking Add: wait for reload, then confirm line count increased (fallback if reload is soft). */
 async function waitForNewAgreementLineAfterAdd(tabId, countBefore) {
   await waitForAgreementItemsPageReload(tabId, 'after Add', NOSPOS_RELOAD_WAIT_MS);
-  await sleep(600);
+  await sleep(250);
   const want = countBefore + 1;
   const start = Date.now();
   const lineWaitMs = NOSPOS_RELOAD_WAIT_MS;
@@ -134,7 +135,7 @@ async function waitForNewAgreementLineAfterAdd(tabId, countBefore) {
     }
     const n = await countNosposAgreementItemLines(tabId);
     if (n >= want) return { ok: true, count: n };
-    await sleep(500);
+    await sleep(250);
   }
   return {
     ok: false,
@@ -338,14 +339,21 @@ async function fillNosposAgreementOneLineImpl(tabId, payload) {
   }
   let restPayload = { ...payload };
   const marker = String(payload.cgParkLineMarker || '').trim();
-  if (marker) {
-    const found = await findNosposLineIndexForMarkerWithFallback(tabId, marker);
-    if (found != null && found >= 0) {
-      restPayload = { ...restPayload, lineIndex: found };
-      console.log('[CG Suite] NosPos park: re-resolved line index after category', {
-        marker,
-        lineIndex: found,
-      });
+  // After the category reload NosPos can bounce back to page 1, so re-find this row. Existing
+  // rows match by marker; a brand-new row (marker not written yet) is the newest → last row
+  // on the last page.
+  const found = marker ? await findNosposLineIndexForMarkerWithFallback(tabId, marker) : null;
+  if (found != null && found >= 0) {
+    restPayload = { ...restPayload, lineIndex: found };
+    console.log('[CG Suite] NosPos park: re-resolved line index after category (page-aware)', {
+      marker,
+      lineIndex: found,
+    });
+  } else {
+    // Brand-new row → last row on the last page.
+    const last = await gotoLastNosposAgreementPage(tabId);
+    if (last.ok && last.count > 0) {
+      restPayload = { ...restPayload, lineIndex: last.count - 1 };
     }
   }
   return applyNosposAgreementRestPhaseImpl(tabId, restPayload, cat.categoryLabel);
@@ -371,32 +379,19 @@ async function fillNosposParkAgreementCategoryImpl(payload) {
     };
   }
   let restLineIndex = lineIndex;
-  const marker = String(item.cgParkLineMarker || '').trim();
-  if (marker) {
-    const found = await findNosposLineIndexForMarkerWithFallback(tabId, marker);
-    if (found != null && found >= 0) {
-      restLineIndex = found;
-      console.log('[CG Suite] NosPos park: rest line index after category (split step)', {
-        marker,
-        restLineIndex,
-      });
-    } else {
-      // Brand-new row: description/marker not written yet, so the marker scan
-      // comes up empty. After the category-triggered reload the row order may
-      // have shifted, so use the current last-row count rather than the
-      // pre-reload lineIndex.
-      const count = await countNosposAgreementItemLines(tabId);
-      if (count > 0) {
-        const lastIdx = count - 1;
-        if (lastIdx !== lineIndex) {
-          console.log('[CG Suite] NosPos park: marker not found after category reload — using last row index', {
-            lineIndex,
-            lastIdx,
-          });
-        }
-        restLineIndex = lastIdx;
-      }
-    }
+  const hasGlobal = item.parkGlobalRowIndex != null && String(item.parkGlobalRowIndex) !== '';
+  const g = hasGlobal ? Math.max(0, parseInt(String(item.parkGlobalRowIndex), 10) || 0) : null;
+  // A category change reloads the items page but does NOT reorder rows, so the line stays at the
+  // exact page-local slot we just set its category on — re-finding it is wasted work. (We must
+  // NOT marker-search here either: the CG marker isn't written into the description until the
+  // rest phase, so the scan is guaranteed to miss, and it fires while the page is mid-reload, so
+  // every attempt burns the full retry budget. That single useless search was costing ~8s/item.)
+  // The only thing a reload can move is the *page*: on a multi-page agreement (rows 21+) it can
+  // bounce the pager back to page 1, so for those rows we cheaply re-navigate to the right page
+  // and keep the same slot. Single-page agreements (≤20 rows) skip all of this.
+  if (g != null && g >= NOSPOS_ITEMS_PER_PAGE) {
+    const onPage = await ensureNosposOnPageForGlobalRow(tabId, g);
+    if (onPage.ok) restLineIndex = onPage.indexInPage;
   }
   return {
     ok: true,
@@ -467,107 +462,86 @@ function pickParkFallbackLineIndex(stepIndex, negotiationLineIndex, countBefore,
 }
 
 /**
- * Find row by description marker, or use row 0, or click Add and wait for new row.
+ * Resolve the page-local row to fill for global row `stepIndex`.
+ *
+ * `stepIndex` is the 0-based GLOBAL row in sequential add order (excluded lines are deleted
+ * before this loop, so row order == included-line order). NosPos paginates at 20 rows/page and
+ * only renders the current page, so row g lives on page floor(g/20)+1 at slot g%20. We:
+ *   1. reuse an existing row by CG marker, searching ALL pages (re-runs / retries), else
+ *   2. position deterministically on the page+slot for g — reuse the slot if a row is already
+ *      there, otherwise click Add (which appends to the last page) and navigate to the slot.
+ * The returned `targetLineIndex` is page-local and the tab is left on the page that holds it.
  */
 async function resolveNosposParkAgreementLineImpl(tabId, stepIndex, item, opts = {}) {
   const noAdd = opts.noAdd === true;
   const alwaysEnsureTab = opts.ensureTab === true;
   const marker = String(item.cgParkLineMarker || '').trim();
-  const parkNegotiationLineCount = opts.parkNegotiationLineCount;
-  const negotiationLineIndex = opts.negotiationLineIndex;
+  const g = Math.max(0, parseInt(String(stepIndex ?? '0'), 10) || 0);
+  const { page: targetPage, indexInPage } = nosposPageForGlobalRow(g);
   logPark('resolveNosposParkAgreementLineImpl', 'enter', {
-    tabId, stepIndex, noAdd, alwaysEnsureTab, marker,
-    parkNegotiationLineCount, negotiationLineIndex,
+    tabId, stepIndex: g, noAdd, alwaysEnsureTab, marker, targetPage, indexInPage,
     itemName: item.name, itemCategoryId: item.categoryId,
-  }, `Resolving NoSpos line for step ${stepIndex}`);
+  }, `Resolving NoSpos line for global row ${g} (page ${targetPage}, slot ${indexInPage})`);
 
-  if (stepIndex === 0 || alwaysEnsureTab) {
-    logPark('resolveNosposParkAgreementLineImpl', 'step', { stepIndex, alwaysEnsureTab }, 'Ensuring items tab is loaded');
+  // Start of a fresh park run (first line, not a retry): reset the adaptive Add pacing so a
+  // previously-throttled run doesn't slow the opening Adds of this one.
+  if (g === 0 && !noAdd) nosposAddCooldownMs = 0;
+
+  if (g === 0 || alwaysEnsureTab) {
     const tabCheck = await ensureNosposAgreementItemsTab(tabId, 120000);
     logPark('resolveNosposParkAgreementLineImpl', 'result', { tabCheck }, 'ensureNosposAgreementItemsTab result');
     if (!tabCheck.ok) return { ...tabCheck, targetLineIndex: undefined };
   }
 
-  let targetLineIndex = null;
-  let reusedExistingRow = false;
-  let didClickAdd = false;
+  // Read the pager once: page-local row count + how many pages exist. Drives every decision
+  // below without extra round-trips.
+  const pager = await readNosposAgreementPager(tabId);
+  const lastPage = pager.ok ? pager.lastPage : 1;
+  const currentPage = pager.ok ? pager.currentPage : 1;
+  const curCount = pager.ok ? pager.count : 0;
 
-  if (marker) {
-    const found = await findNosposLineIndexForMarkerWithFallback(tabId, marker);
-    if (found != null && found >= 0) {
-      targetLineIndex = found;
-      reusedExistingRow = true;
-      const expCat = String(item.categoryId || '').trim();
-      const snap = await readNosposAgreementLineSnapshot(tabId, targetLineIndex);
-      if (snap?.ok) {
-        logPark('resolveNosposParkAgreementLineImpl', 'decision', {
-          marker, targetLineIndex, stepIndex,
-          nosposName: snap.name, nosposDescription: snap.description, nosposCategoryId: snap.categoryId,
-          expectedCategoryId: expCat, categoryMismatch: expCat && snap.categoryId && expCat !== snap.categoryId,
-          markerMissing: !String(snap.description || '').includes(marker),
-        }, 'Reusing existing NoSpos row matched by marker (skipping Add)');
-        console.log('[CG Suite] NosPos park: reusing row with CG marker (skip Add)', {
-          marker, targetLineIndex, stepIndex,
-          nosposName: snap.name, nosposItemDescription: snap.description, nosposCategoryId: snap.categoryId,
-        });
-        if (expCat && snap.categoryId && expCat !== snap.categoryId) {
-          console.warn('[CG Suite] NosPos park: category differs on reused row (fill will overwrite)', { expectedCategoryId: expCat, nosposCategoryId: snap.categoryId });
-        }
-        if (!String(snap.description || '').includes(marker)) {
-          console.warn('[CG Suite] NosPos park: marker missing in Nospos item description before fill', { marker, description: snap.description });
-        }
-      }
-    } else {
-      logPark('resolveNosposParkAgreementLineImpl', 'decision', { marker }, 'Marker not found in any NoSpos row');
+  // 1) Reuse an existing row by marker — but ONLY when rows might exist out of clean sequence:
+  // a retry (noAdd), or genuinely more rows present than this step's position implies. On a clean
+  // forward run the row for this step doesn't exist yet (curCount == slot), so a marker search is
+  // guaranteed to miss. Crucially we do NOT trigger merely because the agreement spans 2+ pages —
+  // doing so made every page-2 item walk both pages (extra reloads), piling on NosPos's throttle.
+  const mightPreexist = noAdd || curCount > indexInPage + 1;
+  if (marker && mightPreexist) {
+    const found = await findNosposLineAcrossPages(tabId, marker);
+    if (found) {
+      logPark('resolveNosposParkAgreementLineImpl', 'decision', { marker, page: found.page, indexInPage: found.indexInPage }, 'Reusing existing NoSpos row matched by marker (cross-page, skip Add)');
+      return { ok: true, targetLineIndex: found.indexInPage, reusedExistingRow: true, didClickAdd: false };
+    }
+    logPark('resolveNosposParkAgreementLineImpl', 'decision', { marker }, 'Marker not found on any page');
+  }
+
+  // 2) Position on the page that should hold global row g (only navigates for page 2+).
+  let onTargetCount = curCount;
+  if (targetPage <= lastPage) {
+    if (targetPage !== currentPage) {
+      const nav = await navigateNosposAgreementToPage(tabId, targetPage);
+      if (!nav.ok) return { ok: false, error: nav.error, targetLineIndex: undefined };
+      onTargetCount = await countNosposAgreementItemLines(tabId);
+    }
+    // A row already sits at this slot (NosPos' blank first row, or a partial prior run) — reuse.
+    if (onTargetCount > indexInPage) {
+      logPark('resolveNosposParkAgreementLineImpl', 'decision', { targetPage, indexInPage, count: onTargetCount }, 'Existing row at target slot — reusing (no Add)');
+      return { ok: true, targetLineIndex: indexInPage, reusedExistingRow: false, didClickAdd: false };
     }
   }
 
-  if (targetLineIndex == null) {
-    const countBefore = await countNosposAgreementItemLines(tabId);
-    const fallbackIdx = pickParkFallbackLineIndex(
-      stepIndex,
-      negotiationLineIndex,
-      countBefore,
-      parkNegotiationLineCount
-    );
-    logPark('resolveNosposParkAgreementLineImpl', 'step', { countBefore, fallbackIdx, stepIndex, noAdd, negotiationLineIndex, parkNegotiationLineCount }, 'Marker not found — deciding between fallback index or Add');
-
-    if (stepIndex === 0 || noAdd) {
-      targetLineIndex = fallbackIdx;
-      logPark('resolveNosposParkAgreementLineImpl', 'decision', { targetLineIndex, reason: stepIndex === 0 ? 'first-step' : 'noAdd' }, 'Using fallback line index (no Add click)');
-      if (noAdd && stepIndex > 0) {
-        console.log('[CG Suite] NosPos park: noAdd — marker not found, using fallback line index', {
-          stepIndex, negotiationLineIndex, fallbackIdx, lineCount: countBefore, parkNegotiationLineCount, reusedExistingRow,
-        });
-      }
-    } else if (countBefore > fallbackIdx) {
-      targetLineIndex = fallbackIdx;
-      logPark('resolveNosposParkAgreementLineImpl', 'decision', { targetLineIndex, countBefore, fallbackIdx }, 'Existing row available at fallback index — skipping Add');
-      console.log('[CG Suite] NosPos park: marker not found; using existing row at fallback index (skip Add)', {
-        stepIndex, negotiationLineIndex, fallbackIdx, lineCount: countBefore, parkNegotiationLineCount, marker,
-      });
-    } else {
-      logPark('resolveNosposParkAgreementLineImpl', 'step', { countBefore, fallbackIdx }, 'No existing row at fallback index — clicking Add');
-      const clickR = await clickNosposAgreementAddItem(tabId);
-      logPark('resolveNosposParkAgreementLineImpl', 'result', { clickR }, 'clickNosposAgreementAddItem result');
-      if (!clickR?.ok) {
-        logPark('resolveNosposParkAgreementLineImpl', 'error', { clickR }, 'Failed to click Add');
-        return { ok: false, error: clickR?.error || 'Could not click Add on NoSpos' };
-      }
-      didClickAdd = true;
-      const waitNew = await waitForNewAgreementLineAfterAdd(tabId, countBefore);
-      logPark('resolveNosposParkAgreementLineImpl', 'result', { waitNew }, 'waitForNewAgreementLineAfterAdd result');
-      if (!waitNew.ok) {
-        return { ok: false, error: waitNew.error };
-      }
-      const countAfter = await countNosposAgreementItemLines(tabId);
-      targetLineIndex = Math.max(0, countAfter - 1);
-      logPark('resolveNosposParkAgreementLineImpl', 'step', { countAfter, targetLineIndex }, 'Add succeeded — targeting last row');
-    }
+  // 3) First row and retry (noAdd) never click Add — use the computed slot as-is.
+  if (g === 0 || noAdd) {
+    logPark('resolveNosposParkAgreementLineImpl', 'decision', { targetLineIndex: indexInPage, reason: g === 0 ? 'first-step' : 'noAdd' }, 'Using slot without Add');
+    return { ok: true, targetLineIndex: indexInPage, reusedExistingRow: false, didClickAdd: false };
   }
 
-  logPark('resolveNosposParkAgreementLineImpl', 'exit', { targetLineIndex, reusedExistingRow, didClickAdd }, 'Line resolved');
-  return { ok: true, targetLineIndex, reusedExistingRow, didClickAdd };
+  // 4) Create the row: Add appends to the last page, then we navigate to page+slot for g.
+  const added = await addNosposAgreementItemAndResolveRow(tabId, g);
+  logPark('resolveNosposParkAgreementLineImpl', 'result', { added }, 'addNosposAgreementItemAndResolveRow result');
+  if (!added.ok) return { ok: false, error: added.error };
+  logPark('resolveNosposParkAgreementLineImpl', 'exit', { targetLineIndex: added.targetLineIndex, page: added.page }, 'Add succeeded');
+  return { ok: true, targetLineIndex: added.targetLineIndex, reusedExistingRow: false, didClickAdd: true };
 }
 
 /**
@@ -647,27 +621,17 @@ async function fillNosposAgreementItemsSequentialImpl(payload) {
     }
     if (targetLineIndex == null) {
       if (i > 0) {
-        const countBefore = await countNosposAgreementItemLines(tabId);
-        const clickR = await clickNosposAgreementAddItem(tabId);
-        if (!clickR?.ok) {
+        // i is the 0-based global row index (sequential add order) → where NosPos appends.
+        const added = await addNosposAgreementItemAndResolveRow(tabId, i);
+        if (!added.ok) {
           return {
             ok: false,
-            error: clickR?.error || 'Could not click Add on NoSpos',
+            error: added.error,
             perItem,
             filledUpToIndex: i - 1,
           };
         }
-        const waitNew = await waitForNewAgreementLineAfterAdd(tabId, countBefore);
-        if (!waitNew.ok) {
-          return {
-            ok: false,
-            error: waitNew.error,
-            perItem,
-            filledUpToIndex: i - 1,
-          };
-        }
-        const countAfter = await countNosposAgreementItemLines(tabId);
-        targetLineIndex = Math.max(0, countAfter - 1);
+        targetLineIndex = added.targetLineIndex;
       } else {
         targetLineIndex = 0;
       }

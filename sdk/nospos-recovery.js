@@ -16,7 +16,7 @@ async function waitForNosposTabComplete(tabId, maxWaitMs = 45000) {
   return { ok: false, error: 'NoSpos page did not finish loading in time after reload' };
 }
 
-async function maybeRecoverNospos429Page(tabId, context = '') {
+async function maybeRecoverNospos429Page(tabId, context = '', forceProbe = false) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) return { ok: false, recovered: false, error: 'The NoSpos tab was closed' };
   const url = String(tab.url || '');
@@ -28,6 +28,14 @@ async function maybeRecoverNospos429Page(tabId, context = '') {
   const last = nospos429LastRecoveryAtByTabId.get(tabId) || 0;
   if (now - last < 5000) {
     return { ok: true, recovered: false, skipped: true };
+  }
+  // Skip the executeScript probe if we very recently confirmed there's no 429 on this tab. The
+  // probe injects a script and is slow on a backgrounded worker tab, so running it before every
+  // single message (count/find/category/etc.) added seconds of dead time per item. A 429 page
+  // persists until we reload it, so a few-second-stale "clean" result is safe.
+  const lastClean = nospos429LastCleanProbeAtByTabId.get(tabId) || 0;
+  if (!forceProbe && now - lastClean < NOSPOS_429_PROBE_CACHE_MS) {
+    return { ok: true, recovered: false, skippedProbe: true };
   }
 
   const probe = await chrome.scripting
@@ -46,7 +54,10 @@ async function maybeRecoverNospos429Page(tabId, context = '') {
     .catch(() => [{ result: { has429Heading: false, heading: null, href: null } }]);
 
   const info = probe?.[0]?.result || { has429Heading: false, heading: null, href: null };
-  if (!info.has429Heading) return { ok: true, recovered: false };
+  if (!info.has429Heading) {
+    nospos429LastCleanProbeAtByTabId.set(tabId, Date.now());
+    return { ok: true, recovered: false };
+  }
 
   nospos429LastRecoveryAtByTabId.set(tabId, Date.now());
   logPark(
@@ -69,7 +80,21 @@ async function maybeRecoverNospos429Page(tabId, context = '') {
   }
 
   await sleep(NOSPOS_429_RELOAD_DELAY_MS);
-  await chrome.tabs.reload(tabId).catch(() => {});
+  // On a POST-rendered NosPos agreement page, a plain reload triggers Chrome's "Confirm Form
+  // Resubmission" interstitial (and re-sends the POST — e.g. a duplicate Add). Re-fetch via a
+  // fresh GET (drop ?query/#hash → new GET navigation, nothing to resubmit). Non-agreement pages
+  // keep the normal reload so query-bearing GET pages (search, etc.) aren't stripped.
+  let didGetNav = false;
+  if (isNosposNewAgreementWorkflowUrl(url)) {
+    try {
+      const u = new URL(url);
+      await chrome.tabs.update(tabId, { url: u.origin + u.pathname }).catch(() => {});
+      didGetNav = true;
+    } catch (_) {}
+  }
+  if (!didGetNav) {
+    await chrome.tabs.reload(tabId).catch(() => {});
+  }
   const waitReload = await waitForNosposTabComplete(tabId, 45000);
 
   // Restore the previously-active tab if the worker stole focus during reload.

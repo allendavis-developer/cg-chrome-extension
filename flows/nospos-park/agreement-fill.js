@@ -15,27 +15,70 @@ async function clickNosposSidebarParkAgreementImpl(payload) {
   if (!tabCheck.ok) {
     return tabCheck;
   }
+  // Fields NosPos rejected on Next (e.g. an invalid IMEI) that we cleared so the
+  // agreement could still park. Threaded back to the page so it can tell the
+  // operator which item lost which field and why.
+  const clearedFields = [];
   try {
     if (tabCheck.onItemsStep) {
-      logPark('clickNosposSidebarParkAgreementImpl', 'step', { tabId }, 'Tab is on items step — clicking Next');
-      const rNext = await sendParkMessageToTabWithAbort(
-        tabId,
-        { type: 'NOSPOS_AGREEMENT_FILL_PHASE', phase: 'click_items_form_next' },
-        18,
-        450
-      );
-      logPark('clickNosposSidebarParkAgreementImpl', 'result', { rNext }, 'click_items_form_next response');
-      if (!rNext || rNext.ok === false) {
-        logPark('clickNosposSidebarParkAgreementImpl', 'error', { rNext }, 'Failed to click Next on items page');
+      // Press Next; if NosPos bounces back to /items with validation errors,
+      // clear the fields it flagged (losing those values) and press Next again.
+      // Park must always go through — we'd rather drop a bad IMEI than abort.
+      const MAX_NEXT_ATTEMPTS = 4;
+      let leftItems = false;
+      for (let attempt = 0; attempt < MAX_NEXT_ATTEMPTS && !leftItems; attempt += 1) {
+        logPark('clickNosposSidebarParkAgreementImpl', 'step', { tabId, attempt }, 'Tab is on items step — clicking Next');
+        const rNext = await sendParkMessageToTabWithAbort(
+          tabId,
+          { type: 'NOSPOS_AGREEMENT_FILL_PHASE', phase: 'click_items_form_next' },
+          18,
+          450
+        );
+        logPark('clickNosposSidebarParkAgreementImpl', 'result', { rNext, attempt }, 'click_items_form_next response');
+        if (!rNext || rNext.ok === false) {
+          logPark('clickNosposSidebarParkAgreementImpl', 'error', { rNext }, 'Failed to click Next on items page');
+          return {
+            ok: false,
+            error: rNext?.error || 'Could not press Next on the NoSpos items page',
+            clearedFields,
+          };
+        }
+        const waitNav = await waitAfterAgreementItemsNextClick(tabId, NOSPOS_RELOAD_WAIT_MS);
+        logPark('clickNosposSidebarParkAgreementImpl', 'result', { waitNav, attempt }, 'Wait-after-Next navigation result');
+        if (waitNav.ok) {
+          leftItems = true;
+          break;
+        }
+        // Didn't leave /items. If the tab is gone, bail with that error.
+        const stillThere = await chrome.tabs.get(tabId).catch(() => null);
+        if (!stillThere) {
+          return { ok: false, error: 'The NoSpos tab was closed', clearedFields };
+        }
+        // NosPos likely re-rendered the items form with validation errors —
+        // clear the offending fields and try Next again.
+        const cleared = await sendParkMessageToTabWithAbort(
+          tabId,
+          { type: 'NOSPOS_AGREEMENT_FILL_PHASE', phase: 'clear_errored_fields' },
+          8,
+          400
+        ).catch(() => null);
+        const clearedNow =
+          cleared && cleared.ok && Array.isArray(cleared.cleared) ? cleared.cleared : [];
+        logPark('clickNosposSidebarParkAgreementImpl', 'step', { attempt, clearedCount: clearedNow.length }, 'Checked for NoSpos validation errors after Next');
+        if (!clearedNow.length) {
+          // Nothing clearable → genuine failure; surface the navigation error.
+          return { ...waitNav, clearedFields };
+        }
+        clearedFields.push(...clearedNow);
+        // loop: press Next again now that the bad fields are empty.
+      }
+      if (!leftItems) {
         return {
           ok: false,
-          error: rNext?.error || 'Could not press Next on the NoSpos items page',
+          error:
+            'NoSpos kept rejecting the items form even after clearing the invalid fields it flagged — check the NoSpos tab.',
+          clearedFields,
         };
-      }
-      const waitNav = await waitAfterAgreementItemsNextClick(tabId, NOSPOS_RELOAD_WAIT_MS);
-      logPark('clickNosposSidebarParkAgreementImpl', 'result', { waitNav }, 'Wait-after-Next navigation result');
-      if (!waitNav.ok) {
-        return waitNav;
       }
     } else {
       logPark('clickNosposSidebarParkAgreementImpl', 'step', { tabId }, 'Tab is past items step — skipping Next, waiting 500ms');
@@ -69,7 +112,7 @@ async function clickNosposSidebarParkAgreementImpl(payload) {
 
     if (first.kind === 'buying' && first.ok) {
       logPark('clickNosposSidebarParkAgreementImpl', 'exit', { parked: true, via: 'buying-hub-race' }, 'Park confirmed — buying hub reached first in race');
-      return { ok: true, parked: true };
+      return { ok: true, parked: true, clearedFields };
     }
 
     const r = first.kind === 'park' ? first : await parkSidebarPromise;
@@ -78,21 +121,22 @@ async function clickNosposSidebarParkAgreementImpl(payload) {
 
     if (buyingReached.ok) {
       logPark('clickNosposSidebarParkAgreementImpl', 'exit', { parked: true, via: 'buying-hub-poll' }, 'Park confirmed — buying hub reached after sidebar');
-      return { ok: true, parked: true };
+      return { ok: true, parked: true, clearedFields };
     }
     if (!r.ok || r.result?.ok === false) {
       const err = r.error || r.result?.error || buyingReached.error || 'NoSpos did not complete sidebar Park Agreement';
       logPark('clickNosposSidebarParkAgreementImpl', 'error', { parkResult: r, buyingReached, err }, 'Park sidebar failed');
-      return { ok: false, error: err };
+      return { ok: false, error: err, clearedFields };
     }
     logPark('clickNosposSidebarParkAgreementImpl', 'error', { buyingReached }, 'Park sidebar sent but buying hub not reached');
     return {
       ok: false,
       error: buyingReached.error || 'NoSpos did not return to Buying after Park.',
+      clearedFields,
     };
   } catch (e) {
     logPark('clickNosposSidebarParkAgreementImpl', 'error', { error: e?.message }, 'Unexpected exception in sidebar park');
-    return { ok: false, error: e?.message || String(e) || 'Sidebar park failed' };
+    return { ok: false, error: e?.message || String(e) || 'Sidebar park failed', clearedFields };
   }
 }
 

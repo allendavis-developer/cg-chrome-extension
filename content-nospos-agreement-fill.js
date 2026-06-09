@@ -5,6 +5,10 @@
   const NS = '[CG Suite NosPos fill]';
   /** Small safety pause before high-impact Actions menu clicks (park/delete) to avoid server rate limiting. */
   const NOSPOS_ACTION_CLICK_DELAY_MS = 1200;
+  /** NosPos paginates the agreement items list at 20 rows per page (mirror of the
+   *  background flow's NOSPOS_ITEMS_PER_PAGE). Used to turn a page-local card
+   *  index into the global row index the park flow keys items by. */
+  const NOSPOS_ITEMS_PER_PAGE = 20;
 
   function log() {
     const args = Array.prototype.slice.call(arguments);
@@ -931,6 +935,91 @@
   }
 
   /**
+   * Item name shown on the card a node belongs to (the line's
+   * DraftAgreementItem[..][name] input), for mapping a cleared field back to a
+   * CG Suite line by name. Empty string when it can't be found.
+   */
+  function itemNameForNode(node) {
+    const card = node && node.closest ? node.closest('.card') : null;
+    const scope = card || document;
+    const nameInp = scope.querySelector('input[name*="DraftAgreementItem"][name$="[name]"]');
+    return nameInp ? String(nameInp.value || '').trim() : '';
+  }
+
+  /**
+   * Global (cross-page) 0-based row index for the card a node belongs to, or
+   * null if it can't be resolved. On a clean park run this matches the flow's
+   * sequential stepIndex, so the page can map a cleared field back to the right
+   * line (page offset + the card's slot among this page's category selects).
+   */
+  function globalRowIndexForNode(node) {
+    const card = node && node.closest ? node.closest('.card') : null;
+    if (!card) return null;
+    const catSel = card.querySelector('select[name*="DraftAgreementItem"][name$="[category]"]');
+    if (!catSel) return null;
+    const pageLocal = listCategorySelects().indexOf(catSel);
+    if (pageLocal < 0) return null;
+    const pager = runReadAgreementPager();
+    const page = pager && pager.currentPage ? pager.currentPage : 1;
+    return (page - 1) * NOSPOS_ITEMS_PER_PAGE + pageLocal;
+  }
+
+  /**
+   * NosPos rejected the items form on Next (e.g. "Invalid IMEI"): find every
+   * field it flagged with `.has-error`, record what it was (so CG Suite can tell
+   * the operator which item lost which field and why), then CLEAR the offending
+   * text so a re-submit can go through. We deliberately drop the bad value
+   * rather than block parking. Selects are left alone — clearing one would just
+   * re-trigger a "required" error and loop — and so are already-empty fields
+   * (clearing them can't lift the error). Returns the per-field reports.
+   */
+  function runClearErroredAgreementFields() {
+    const form = itemsFormRootEl() || document;
+    const groups = Array.from(form.querySelectorAll('.form-group.has-error'));
+    const cleared = [];
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      const input =
+        g.querySelector('input.form-control:not([type="hidden"])') ||
+        g.querySelector('textarea.form-control');
+      if (!input) continue; // select / no editable text control — leave it
+      const prev = readControlValue(input);
+      if (!prev) continue; // already empty — clearing won't lift the error
+      const labEl = g.querySelector('label.control-label') || g.querySelector('label');
+      const fieldLabel = labEl ? String(labEl.textContent || '').replace(/\s+/g, ' ').trim() : '';
+      const errEl =
+        g.querySelector('.help-block-error') || g.querySelector('.help-block.help-block-error');
+      const errorText = errEl
+        ? String(errEl.textContent || '').replace(/\s+/g, ' ').trim()
+        : 'NoSpos rejected this value';
+      const report = {
+        fieldLabel: fieldLabel || 'Field',
+        errorText: errorText || 'NoSpos rejected this value',
+        previousValue: prev,
+        itemName: itemNameForNode(g),
+        globalRowIndex: globalRowIndexForNode(g),
+      };
+      input.value = '';
+      dispatchControlEvents(input);
+      log('cleared errored field', report);
+      logToBackground(
+        'runClearErroredAgreementFields',
+        'step',
+        report,
+        'Cleared a NoSpos-rejected field so the items form can re-submit'
+      );
+      cleared.push(report);
+    }
+    logToBackground(
+      'runClearErroredAgreementFields',
+      'exit',
+      { clearedCount: cleared.length },
+      'Finished clearing NoSpos-rejected fields'
+    );
+    return { ok: true, cleared };
+  }
+
+  /**
    * Agreement summary sidebar (col-lg-3): Actions → Park Agreement → confirm SweetAlert.
    * POST link href like /newagreement/73908/park
    */
@@ -1362,6 +1451,10 @@
       }
       if (msg.phase === 'click_items_form_next') {
         sendResponse(runClickItemsFormNext());
+        return true;
+      }
+      if (msg.phase === 'clear_errored_fields') {
+        sendResponse(runClearErroredAgreementFields());
         return true;
       }
       if (msg.phase === 'sidebar_park_agreement') {

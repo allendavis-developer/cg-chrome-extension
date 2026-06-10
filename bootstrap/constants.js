@@ -54,22 +54,27 @@ const NOSPOS_RATELIMIT_MAX_ATTEMPTS = 3;
 const NOSPOS_ADD_MAX_ATTEMPTS = 4;
 /** After an Add is confirmed dropped (row never created, throttled), wait this long for NosPos's
  *  POST throttle to reset before re-clicking Add. Re-adding is safe here: the reload proved no
- *  row was created, so there's no duplicate risk. */
-const NOSPOS_ADD_DROP_COOLDOWN_MS = 15000;
+ *  row was created, so there's no duplicate risk. Validation rejections (NosPos re-rendering the
+ *  form with .has-error) are detected and handled separately and never reach this cooldown —
+ *  that's what used to inflate it; with those filtered out a genuine throttle drop is rare and
+ *  the patient GET re-checks already buy recovery time, so this stays modest. */
+const NOSPOS_ADD_DROP_COOLDOWN_MS = 8000;
 /** Once a drop happens, pace ALL subsequent Adds wider by this step (per drop) so we stop
  *  hammering NosPos into the throttle. Decays on a clean Add. */
-const NOSPOS_ADD_COOLDOWN_STEP_MS = 4000;
+const NOSPOS_ADD_COOLDOWN_STEP_MS = 2000;
 /** Ceiling for the adaptive per-Add pacing. */
-const NOSPOS_ADD_COOLDOWN_MAX_MS = 16000;
+const NOSPOS_ADD_COOLDOWN_MAX_MS = 8000;
 /** Adaptive extra pre-Add pacing, grown by confirmed drops and decayed by clean Adds. */
 let nosposAddCooldownMs = 0;
 const nospos429LastRecoveryAtByTabId = new Map();
 /** Last time the 429 probe ran and found NO 429, per tab. Lets us skip the (expensive on a
  *  backgrounded tab) executeScript probe during rapid message bursts. */
 const nospos429LastCleanProbeAtByTabId = new Map();
-/** How long a clean 429 probe stays valid before we re-probe (ms). Short enough that a 429 that
- *  appears during a long post-Add wait is still caught within a couple seconds. */
-const NOSPOS_429_PROBE_CACHE_MS = 2500;
+/** How long a clean 429 probe stays valid before we re-probe (ms). The probe is an executeScript
+ *  into a backgrounded tab — expensive, and it runs before every tab message — so keep the cache
+ *  wide. The places where a 429 genuinely matters (the post-Add wait, the recovery reload) FORCE
+ *  the probe and bypass this cache, so widening it doesn't delay real 429 detection there. */
+const NOSPOS_429_PROBE_CACHE_MS = 6000;
 
 /**
  * TEST ONLY: when true, Park Agreement intentionally fails after 2 included items.

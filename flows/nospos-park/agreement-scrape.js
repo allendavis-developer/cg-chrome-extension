@@ -291,23 +291,30 @@ async function addNosposAgreementItemAndResolveRow(tabId, globalTargetIndex) {
   const { page: expectedPage, indexInPage: expectedIndexInPage } =
     nosposPageForGlobalRow(globalTargetIndex);
 
-  // Re-click Add ONLY when we have PROOF no row was created (a detected 429, or a recovery reload
-  // that confirms the count didn't change). Re-clicking on a merely slow render would duplicate.
+  // Fields NosPos rejected on the Add submit (e.g. an invalid IMEI on an earlier
+  // line) that we cleared so the Add could go through. Returned to the caller on
+  // every path so the operator can be told which item lost which field and why.
+  const clearedFields = [];
+
+  // Re-click Add ONLY when we have PROOF no row was created (a detected 429, a validation
+  // rejection whose flagged fields we cleared, or a recovery reload that confirms the count
+  // didn't change). Re-clicking on a merely slow render would duplicate.
   for (let attempt = 0; attempt < NOSPOS_ADD_MAX_ATTEMPTS; attempt += 1) {
     const clickR = await clickNosposAgreementAddItem(tabId);
     if (!clickR?.ok) {
-      return { ok: false, error: clickR?.error || 'Could not click Add on NoSpos' };
+      return { ok: false, error: clickR?.error || 'Could not click Add on NoSpos', clearedFields };
     }
     await waitForAgreementItemsPageReload(tabId, 'after Add', NOSPOS_ADD_ROW_WAIT_MS);
 
     let rateLimited = false;
+    let validationCleared = false;
     // Wait generously for the row: once NosPos is throttling, a *successful* Add's reload can
     // run well past a normal one. Failing early here (and telling the operator to Retry) was the
     // worse outcome — the row was usually just slow, not missing.
     const deadline = Date.now() + NOSPOS_ADD_ROW_WAIT_MS;
     while (Date.now() < deadline) {
       const t = await chrome.tabs.get(tabId).catch(() => null);
-      if (!t) return { ok: false, error: 'The NoSpos tab was closed' };
+      if (!t) return { ok: false, error: 'The NoSpos tab was closed', clearedFields };
       if (t.status !== 'complete') { await sleep(300); continue; }
       // 429 "Too Many Requests"? recover (pause + reload) and re-Add — the row never got created.
       // Force the probe (bypass the cache): this long wait is exactly when a 429 can surface.
@@ -334,10 +341,58 @@ async function addNosposAgreementItemAndResolveRow(tabId, globalTargetIndex) {
             { globalTargetIndex, expectedPage, expectedIndexInPage, count, attempt, adaptiveCooldownMs: nosposAddCooldownMs },
             'New row resolved after Add (deterministic page + slot)'
           );
-          return { ok: true, targetLineIndex: expectedIndexInPage, page: expectedPage };
+          return { ok: true, targetLineIndex: expectedIndexInPage, page: expectedPage, clearedFields };
+        }
+
+        // Row missing on a fully-rendered items page. The Add submit POSTs the WHOLE items form,
+        // so NosPos may have REJECTED it on validation (e.g. "Invalid IMEI" on an earlier line) —
+        // it re-renders the form with `.has-error` markup and creates no row. Detect that NOW
+        // (not after the 20s wait + recovery reloads, which would also wipe the unsaved values):
+        // clear the flagged fields, record what was dropped, and re-click Add.
+        const errProbe = await sendParkMessageToTabWithAbort(
+          tabId,
+          { type: 'NOSPOS_AGREEMENT_FILL_PHASE', phase: 'clear_errored_fields' },
+          6,
+          350
+        ).catch(() => null);
+        if (errProbe && errProbe.ok && (errProbe.errorGroupCount || 0) > 0) {
+          const clearedNow = Array.isArray(errProbe.cleared) ? errProbe.cleared : [];
+          if (clearedNow.length) {
+            clearedFields.push(...clearedNow);
+            validationCleared = true;
+            logPark(
+              'addNosposAgreementItemAndResolveRow',
+              'step',
+              { attempt, clearedCount: clearedNow.length, cleared: clearedNow },
+              'NoSpos rejected the Add on validation — cleared the flagged fields, re-adding'
+            );
+            break;
+          }
+          // Errors NosPos flagged but nothing we can safely clear (e.g. an empty
+          // required select) — waiting longer can't fix it, so fail fast with a
+          // pointed message instead of burning the wait + recovery + cooldown.
+          logPark(
+            'addNosposAgreementItemAndResolveRow',
+            'error',
+            { attempt, errorGroupCount: errProbe.errorGroupCount },
+            'NoSpos flagged validation errors that could not be auto-cleared'
+          );
+          return {
+            ok: false,
+            error:
+              'NoSpos rejected the items form with a validation error the extension could not clear — fix the highlighted field on the NoSpos tab, then Retry.',
+            clearedFields,
+          };
         }
       }
       await sleep(500);
+    }
+
+    if (validationCleared) {
+      // The flagged values are gone, so the next Add submit is clean — retry right away.
+      // This was a validation rejection, NOT throttling: no drop cooldown, no adaptive growth.
+      await sleep(400);
+      continue;
     }
 
     if (rateLimited) {
@@ -351,7 +406,7 @@ async function addNosposAgreementItemAndResolveRow(tabId, globalTargetIndex) {
     // and re-check: the Add POST may have landed while the render stalled, or it may have been
     // dropped by NosPos's throttle.
     const recovered = await recoverAddedRowViaReload(tabId, expectedPage, expectedIndexInPage);
-    if (recovered.ok) return recovered;
+    if (recovered.ok) return { ...recovered, clearedFields };
 
     if (recovered.droppedConfirmed && attempt < NOSPOS_ADD_MAX_ATTEMPTS - 1) {
       // PROVEN dropped (count unchanged after reload) → safe to re-Add. Grow the adaptive pacing
@@ -376,6 +431,7 @@ async function addNosposAgreementItemAndResolveRow(tabId, globalTargetIndex) {
     ok: false,
     error:
       'NoSpos did not show a new item row after Add (it may be rate-limiting). Wait a moment and use Retry on that line, or check the NoSpos tab.',
+    clearedFields,
   };
 }
 

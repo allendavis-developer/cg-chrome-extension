@@ -977,6 +977,7 @@
     const form = itemsFormRootEl() || document;
     const groups = Array.from(form.querySelectorAll('.form-group.has-error'));
     const cleared = [];
+    const errorGroupCount = groups.length;
     for (let i = 0; i < groups.length; i++) {
       const g = groups[i];
       const input =
@@ -1013,10 +1014,10 @@
     logToBackground(
       'runClearErroredAgreementFields',
       'exit',
-      { clearedCount: cleared.length },
+      { clearedCount: cleared.length, errorGroupCount },
       'Finished clearing NoSpos-rejected fields'
     );
-    return { ok: true, cleared };
+    return { ok: true, cleared, errorGroupCount };
   }
 
   /**

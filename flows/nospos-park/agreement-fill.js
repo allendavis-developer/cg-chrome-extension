@@ -583,9 +583,15 @@ async function resolveNosposParkAgreementLineImpl(tabId, stepIndex, item, opts =
   // 4) Create the row: Add appends to the last page, then we navigate to page+slot for g.
   const added = await addNosposAgreementItemAndResolveRow(tabId, g);
   logPark('resolveNosposParkAgreementLineImpl', 'result', { added }, 'addNosposAgreementItemAndResolveRow result');
-  if (!added.ok) return { ok: false, error: added.error };
+  if (!added.ok) return { ok: false, error: added.error, clearedFields: added.clearedFields };
   logPark('resolveNosposParkAgreementLineImpl', 'exit', { targetLineIndex: added.targetLineIndex, page: added.page }, 'Add succeeded');
-  return { ok: true, targetLineIndex: added.targetLineIndex, reusedExistingRow: false, didClickAdd: true };
+  return {
+    ok: true,
+    targetLineIndex: added.targetLineIndex,
+    reusedExistingRow: false,
+    didClickAdd: true,
+    clearedFields: added.clearedFields,
+  };
 }
 
 /**
@@ -616,12 +622,15 @@ async function fillNosposAgreementItemStepImpl(payload) {
     lineIndex: resolved.targetLineIndex,
   });
   logPark('fillNosposAgreementItemStepImpl', 'result', { fillOk: fillRes?.ok, lineIndex: resolved.targetLineIndex, warnings: fillRes?.warnings }, 'fillNosposAgreementOneLineImpl result');
-  if (!fillRes?.ok) return fillRes;
+  // Keep any fields the Add step had to clear (NosPos validation rejection) on
+  // the result even when the fill itself fails — the page reports them either way.
+  if (!fillRes?.ok) return { ...(fillRes || { ok: false }), clearedFields: resolved.clearedFields };
   const out = {
     ...fillRes,
     reusedExistingRow: resolved.reusedExistingRow,
     targetLineIndex: resolved.targetLineIndex,
     didClickAdd: resolved.didClickAdd,
+    clearedFields: resolved.clearedFields,
   };
   logPark('fillNosposAgreementItemStepImpl', 'exit', { targetLineIndex: out.targetLineIndex, reusedExistingRow: out.reusedExistingRow, didClickAdd: out.didClickAdd }, `Step ${stepIndex} complete`);
   return out;
@@ -643,6 +652,7 @@ async function fillNosposAgreementItemsSequentialImpl(payload) {
   if (!tabCheck.ok) return tabCheck;
 
   const perItem = [];
+  const seqClearedFields = [];
   for (let i = 0; i < items.length; i += 1) {
     const marker = String(items[i].cgParkLineMarker || '').trim();
     let targetLineIndex = null;
@@ -667,12 +677,16 @@ async function fillNosposAgreementItemsSequentialImpl(payload) {
       if (i > 0) {
         // i is the 0-based global row index (sequential add order) → where NosPos appends.
         const added = await addNosposAgreementItemAndResolveRow(tabId, i);
+        if (Array.isArray(added.clearedFields) && added.clearedFields.length) {
+          seqClearedFields.push(...added.clearedFields);
+        }
         if (!added.ok) {
           return {
             ok: false,
             error: added.error,
             perItem,
             filledUpToIndex: i - 1,
+            clearedFields: seqClearedFields,
           };
         }
         targetLineIndex = added.targetLineIndex;
@@ -705,5 +719,6 @@ async function fillNosposAgreementItemsSequentialImpl(payload) {
     applied: last?.applied,
     missingRequired: last?.missingRequired,
     warnings: last?.warnings,
+    clearedFields: seqClearedFields,
   };
 }

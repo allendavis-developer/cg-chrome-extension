@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CG Suite Research",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "Capture listing data from eBay, Cash Converters, and Cash Generator for CG Suite research forms.",
   "permissions": [
     "activeTab",
@@ -75,6 +75,11 @@
         "cex-scrape/cex-nav-parser.js",
         "cex-scrape/content-cex-nav-scrape.js"
       ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://webepos.cashgenerator.co.uk/*"],
+      "js": ["shared/dom-utils.js", "shared/constants.js", "content-webepos.js"],
       "run_at": "document_idle"
     },
     {

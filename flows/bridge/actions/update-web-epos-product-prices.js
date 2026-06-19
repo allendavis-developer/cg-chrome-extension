@@ -26,7 +26,8 @@ async function handleBridgeAction_updateWebEposProductPrices({ requestId, appTab
     requestId,
     appTabId,
     payload.updateList,
-    payload.uploadProgressCartKey
+    payload.uploadProgressCartKey,
+    await resolveWebEposTargetStore(payload?.targetStore)
   );
   return { ok: true };
 }

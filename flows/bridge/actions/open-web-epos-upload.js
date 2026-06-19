@@ -41,6 +41,15 @@ async function handleBridgeAction_openWebEposUpload({ requestId, appTabId, paylo
     WEB_EPOS_PRODUCTS_URL,
     appTabId
   );
+  // Remember which NosPos shop the operator is logged into (and the distinctive
+  // match substring) so the products tab can auto-filter Web EPOS to the same
+  // store and tell them to keep it consistent (preflight already confirmed
+  // login + shop match above).
+  await writeWebEposUploadSession({
+    nosposShop: preflight.nosposShop || null,
+    expectedShopMatch: expectedShopMatch || null,
+    expectedCgShopName: expectedCgShopName || null,
+  });
   logUpload('openWebEposUpload', 'worker-tab-open', { webeposTabId, url: WEB_EPOS_PRODUCTS_URL });
   const pending = await getPending();
   const entry = { appTabId, listingTabId: webeposTabId, type: 'openWebEposUpload' };

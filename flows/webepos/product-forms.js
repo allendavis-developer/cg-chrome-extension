@@ -59,6 +59,242 @@ async function webEposAssertNewProductPageNotLogin(tabId) {
   return u;
 }
 
+/**
+ * Switch the Web EPOS `#storeId` store selector to the store the scraped listings
+ * came from, so audits and new-product uploads always act against the right store.
+ *
+ * Matching: exact option value (the scraped storeId) first, then a normalised name
+ * compare ("CG Warrington" == "Warrington") as a fallback.
+ *
+ * Returns:
+ *   { ok: true, selected }          — switched (or already on the right store)
+ *   { ok: true, skipped: true }     — no target store given; caller keeps prior behaviour
+ *   { ok: false, notFound: true }   — the store isn't in the switcher list (caller must
+ *                                     close the tab and tell the user)
+ *   { ok: false, error }            — switcher/page problem
+ */
+async function injectWebEposSelectStoreOrFail(tabId, targetStore) {
+  const storeId = targetStore && targetStore.storeId != null ? String(targetStore.storeId).trim() : '';
+  const storeName = targetStore && targetStore.storeName != null ? String(targetStore.storeName).trim() : '';
+  if (!storeId && !storeName) return { ok: true, skipped: true };
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    args: [storeId, storeName],
+    func: async (wantId, wantName) => {
+      const sel = document.querySelector('#storeId, select[name="storeId"]');
+      if (!sel) return { ok: false, noSelect: true };
+      const norm = (s) => {
+        let t = String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        if (t.indexOf('cg ') === 0) t = t.slice(3).trim();
+        if (t.length > 3 && t.lastIndexOf(' cg') === t.length - 3) t = t.slice(0, -3).trim();
+        return t;
+      };
+      const opts = Array.prototype.slice.call(sel.options || []);
+      let match = null;
+      if (wantId) match = opts.find((o) => String(o.value) === wantId) || null;
+      if (!match && wantName) {
+        const want = norm(wantName);
+        match =
+          opts.find((o) => norm(o.textContent) === want) ||
+          opts.find((o) => {
+            const n = norm(o.textContent);
+            return n && (n.indexOf(want) !== -1 || want.indexOf(n) !== -1);
+          }) ||
+          null;
+      }
+      if (!match) {
+        return { ok: false, notFound: true, options: opts.map((o) => String(o.textContent || '').trim()) };
+      }
+      if (String(sel.value) === String(match.value)) {
+        return { ok: true, selected: String(match.textContent || '').trim(), value: match.value, alreadySelected: true };
+      }
+
+      function firstRowBarcode() {
+        const tr = document.querySelector('tbody tr');
+        if (!tr) return '';
+        const cell = tr.querySelector('td');
+        return cell ? String(cell.textContent || '').trim().replace(/\s+/g, ' ') : '';
+      }
+      /**
+       * Event-driven wait — MutationObserver fires on the row swap even in a
+       * background/unfocused tab, where setTimeout is throttled to ≥1s. This is
+       * the whole fix: without waiting for the list to actually reflect the new
+       * store, the caller's product-find runs against the OLD store's table and
+       * reports "product not found".
+       */
+      function waitForDomCondition(predicate, timeoutMs) {
+        return new Promise((resolve) => {
+          try {
+            if (predicate()) return resolve(true);
+          } catch (_) {}
+          let done = false;
+          const obs = new MutationObserver(() => {
+            if (done) return;
+            try {
+              if (predicate()) {
+                done = true;
+                obs.disconnect();
+                clearTimeout(to);
+                resolve(true);
+              }
+            } catch (_) {}
+          });
+          obs.observe(document.documentElement, {
+            childList: true,
+            subtree: true,
+            characterData: true,
+            attributes: true,
+          });
+          const to = setTimeout(() => {
+            if (done) return;
+            done = true;
+            obs.disconnect();
+            resolve(false);
+          }, Math.max(100, timeoutMs));
+        });
+      }
+
+      const before = firstRowBarcode();
+      const proto = Object.getPrototypeOf(sel);
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc && typeof desc.set === 'function') desc.set.call(sel, match.value);
+      else sel.value = match.value;
+      sel.dispatchEvent(new Event('input', { bubbles: true }));
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // Web EPOS does NOT re-fetch on select change — the operator clicks a
+      // "Filter" button to apply store/status. Click it for them, else the list
+      // stays on the old store and the product is never found.
+      (function clickFilterButton() {
+        const btns = Array.prototype.slice.call(document.querySelectorAll('button'));
+        const btn = btns.find((b) => /^filter$/i.test(String(b.textContent || '').trim()));
+        if (btn) {
+          try {
+            btn.click();
+          } catch (_) {}
+        }
+      })();
+
+      // Wait until the product rows actually swap to the new store before
+      // returning (cap generously — a cold store fetch can be slow).
+      const swapped = await waitForDomCondition(() => {
+        const bc = firstRowBarcode();
+        return bc && bc !== before;
+      }, 12000);
+      return { ok: true, selected: String(match.textContent || '').trim(), value: match.value, swapped };
+    },
+  });
+  const r = results && results[0] ? results[0].result : null;
+  if (!r) return { ok: false, error: 'Could not read the Web EPOS store switcher.' };
+  if (r.noSelect) return { ok: false, error: 'The Web EPOS store switcher was not found on the page.' };
+  if (r.notFound) return { ok: false, notFound: true };
+  // Small settle buffer on top of the in-page row-swap wait.
+  await sleep(300);
+  return { ok: true, selected: r.selected };
+}
+
+/**
+ * Switch the Web EPOS `#status` filter (onsale/soldout/unavailable/uploading) to
+ * the status a product was scraped under, BEFORE walking the list to find it —
+ * Web EPOS only lists one status at a time, so a Sold Out item won't appear while
+ * the filter is on On Sale. Best-effort: if the page has no status filter or the
+ * status is unknown, leave it as-is (the find can still succeed for the default
+ * status). `statusRaw` may be a value ("soldout") or a label ("Sold Out").
+ */
+async function injectWebEposSelectStatusOrSkip(tabId, statusRaw) {
+  const want = String(statusRaw == null ? '' : statusRaw).trim();
+  if (!want) return { ok: true, skipped: true };
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    args: [want],
+    func: async (wantRaw) => {
+      const sel = document.querySelector('#status, select[name="status"]');
+      if (!sel) return { ok: true, noSelect: true };
+      const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const target = norm(wantRaw);
+      const opts = Array.prototype.slice.call(sel.options || []);
+      const match =
+        opts.find((o) => norm(o.value) === target) ||
+        opts.find((o) => norm(o.textContent) === target) ||
+        null;
+      if (!match) return { ok: true, notFound: true };
+      if (String(sel.value) === String(match.value)) return { ok: true, alreadySelected: true };
+
+      function firstRowBarcode() {
+        const tr = document.querySelector('tbody tr');
+        if (!tr) return '';
+        const cell = tr.querySelector('td');
+        return cell ? String(cell.textContent || '').trim().replace(/\s+/g, ' ') : '';
+      }
+      function waitForDomCondition(predicate, timeoutMs) {
+        return new Promise((resolve) => {
+          try {
+            if (predicate()) return resolve(true);
+          } catch (_) {}
+          let done = false;
+          const obs = new MutationObserver(() => {
+            if (done) return;
+            try {
+              if (predicate()) {
+                done = true;
+                obs.disconnect();
+                clearTimeout(to);
+                resolve(true);
+              }
+            } catch (_) {}
+          });
+          obs.observe(document.documentElement, {
+            childList: true,
+            subtree: true,
+            characterData: true,
+            attributes: true,
+          });
+          const to = setTimeout(() => {
+            if (done) return;
+            done = true;
+            obs.disconnect();
+            resolve(false);
+          }, Math.max(100, timeoutMs));
+        });
+      }
+
+      const before = firstRowBarcode();
+      const proto = Object.getPrototypeOf(sel);
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc && typeof desc.set === 'function') desc.set.call(sel, match.value);
+      else sel.value = match.value;
+      sel.dispatchEvent(new Event('input', { bubbles: true }));
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // Web EPOS only re-fetches when the Filter button is clicked — apply it.
+      (function clickFilterButton() {
+        const btns = Array.prototype.slice.call(document.querySelectorAll('button'));
+        const btn = btns.find((b) => /^filter$/i.test(String(b.textContent || '').trim()));
+        if (btn) {
+          try {
+            btn.click();
+          } catch (_) {}
+        }
+      })();
+
+      await waitForDomCondition(() => {
+        const bc = firstRowBarcode();
+        return bc && bc !== before;
+      }, 12000);
+      return { ok: true, selected: String(match.textContent || '').trim() };
+    },
+  });
+  const r = results && results[0] ? results[0].result : null;
+  if (!r) return { ok: false, error: 'Could not read the Web EPOS status switcher.' };
+  await sleep(200);
+  // noSelect = the page has no Status filter → status-cycling can't help the caller.
+  return { ok: true, noSelect: !!r.noSelect };
+}
+
 async function injectWebEposEnsureOnSaleOff(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId },
@@ -152,7 +388,13 @@ async function injectWebEposNewProductFinishSave(tabId) {
  * off, click Save Product, wait for redirect, then move to the next row. Progress mirrors repricing
  * (`broadcastRepricingStatus`) when `uploadProgressCartKey` is set.
  */
-async function openWebEposProductCreateMinimizedAndRespond(requestId, appTabId, createListRaw, uploadProgressCartKey) {
+/** User-facing message when the listings' store isn't selectable in Web EPOS. */
+function webEposStoreNotAvailableMessage(targetStore) {
+  const name = (targetStore && (targetStore.storeName || targetStore.storeId)) || 'that store';
+  return `The "${name}" store isn't available in the Web EPOS store switcher — closing Web EPOS. Check you're signed into Web EPOS on the right store.`;
+}
+
+async function openWebEposProductCreateMinimizedAndRespond(requestId, appTabId, createListRaw, uploadProgressCartKey, targetStore) {
   logUpload('uploadCreateRun', 'start', {
     requestId,
     appTabId,
@@ -176,6 +418,14 @@ async function openWebEposProductCreateMinimizedAndRespond(requestId, appTabId, 
     .map(sanitizeWebEposProductCreateSpec)
     .filter(Boolean)
     .slice(0, 20);
+  // Force every new product onto the store the scraped listings came from (the
+  // store switcher is also re-asserted per item below, which fails-closed if it
+  // isn't selectable). Overrides any per-row storeId so we never fall back to
+  // pickFirstNonEmptyStore and silently create against the wrong store.
+  if (targetStore && targetStore.storeId != null && String(targetStore.storeId).trim()) {
+    const sid = String(targetStore.storeId).trim();
+    for (const s of createList) s.storeId = sid;
+  }
   logUpload('uploadCreateRun', 'list-sanitized', {
     raw: rawList.length,
     sanitized: createList.length,
@@ -325,6 +575,18 @@ async function openWebEposProductCreateMinimizedAndRespond(requestId, appTabId, 
         }
         lastUrl = await webEposAssertNewProductPageNotLogin(webEposWorkerTabId);
         logUpload('uploadCreateRun', 'item-page-ready', { ...itemCtx, url: lastUrl });
+
+        // Switch the store selector to the listings' store first. If it isn't in
+        // the list, abort the whole run — the catch below closes Web EPOS and
+        // tells the operator.
+        const storeSwitch = await injectWebEposSelectStoreOrFail(webEposWorkerTabId, targetStore);
+        if (storeSwitch.notFound) {
+          throw new Error(webEposStoreNotAvailableMessage(targetStore));
+        }
+        if (!storeSwitch.ok) {
+          throw new Error(storeSwitch.error || 'Could not set the Web EPOS store.');
+        }
+        logUpload('uploadCreateRun', 'item-store-set', { ...itemCtx, store: storeSwitch.selected || null });
 
         if (cartKey && appTabId) {
           await emitProgress({
@@ -592,7 +854,7 @@ async function injectWebEposWaitForProductLoaded(tabId) {
   }
 }
 
-async function updateWebEposProductPricesAndRespond(requestId, appTabId, updateListRaw, uploadProgressCartKey) {
+async function updateWebEposProductPricesAndRespond(requestId, appTabId, updateListRaw, uploadProgressCartKey, targetStore) {
   // Reset the upload log only when the audit flow runs without an upstream openWebEposUpload reset
   // (e.g. retry path). When openWebEposUpload was just called, we keep its breadcrumbs and continue.
   if (cgUploadLog.length === 0 || cgUploadLogStartTs == null) {
@@ -703,7 +965,10 @@ async function updateWebEposProductPricesAndRespond(requestId, appTabId, updateL
       }
 
       logUpload('auditPriceUpdateRun', 'item-open-begin', itemCtx);
-      const opened = await openWebEposProductInTab(appTabId, spec.productHref, spec.barcode);
+      const opened = await openWebEposProductInTab(appTabId, spec.productHref, spec.barcode, targetStore);
+      if (opened.storeNotFound) {
+        throw new Error(webEposStoreNotAvailableMessage(targetStore));
+      }
       if (!opened.ok) {
         throw new Error(opened.error || 'Could not open product on Web EPOS.');
       }

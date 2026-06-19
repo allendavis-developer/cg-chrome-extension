@@ -79,6 +79,28 @@ async function writeWebEposUploadSession(partial) {
   } catch (_) {}
 }
 
+/**
+ * Resolve the store that audits / uploads should target. Prefers the store the
+ * app passes in the action payload (the snapshot the operator is looking at);
+ * falls back to the store captured during the last products scrape (persisted in
+ * the upload session). Returns null when neither is known (caller keeps its prior
+ * no-switch behaviour).
+ */
+async function resolveWebEposTargetStore(payloadStore) {
+  const pid = payloadStore && payloadStore.storeId != null ? String(payloadStore.storeId).trim() : '';
+  const pname = payloadStore && payloadStore.storeName != null ? String(payloadStore.storeName).trim() : '';
+  if (pid || pname) {
+    return { storeId: pid || null, storeName: pname || null };
+  }
+  const session = await readWebEposUploadSession();
+  const sid = session && session.scrapedStoreId != null ? String(session.scrapedStoreId).trim() : '';
+  const sname = session && session.scrapedStoreName != null ? String(session.scrapedStoreName).trim() : '';
+  if (sid || sname) {
+    return { storeId: sid || null, storeName: sname || null };
+  }
+  return null;
+}
+
 async function clearWebEposUploadSession() {
   try {
     await chrome.storage.session.remove(WEB_EPOS_UPLOAD_SESSION_KEY);
@@ -99,7 +121,8 @@ async function closeWebEposUploadSessionForAppTab(appTabId) {
 
 /**
  * Only the tab id stored in our upload session is reused (never arbitrary Web EPOS tabs).
- * Otherwise opens a new minimised window via openBackgroundNosposTab.
+ * Otherwise opens a new visible (not focused) tab in the app's window via
+ * openWebEposWorkerTab — the operator needs to see/filter it before allowing the scrape.
  */
 async function ensureWebEposUploadWorkerTabOpen(url, appTabId) {
   let session = await readWebEposUploadSession();
@@ -129,7 +152,7 @@ async function ensureWebEposUploadWorkerTabOpen(url, appTabId) {
       await writeWebEposUploadSession({ workerTabId: null, appTabId, lastUrl: url });
     }
   }
-  const { tabId } = await openBackgroundNosposTab(url, appTabId);
+  const { tabId } = await openWebEposWorkerTab(url, appTabId);
   await writeWebEposUploadSession({
     workerTabId: tabId,
     appTabId,

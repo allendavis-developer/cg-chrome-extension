@@ -61,6 +61,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'WEBEPOS_PAGE_READY') {
+    handleWebEposPageReady(sender?.tab?.id)
+      .then((r) => sendResponse(r || { ok: false }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (message.type === 'WEBEPOS_SCRAPE_CONFIRM') {
+    handleWebEposScrapeConfirm(message.requestId, sender?.tab?.id)
+      .then((r) => sendResponse(r || { ok: false }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (message.type === 'WEBEPOS_SCRAPE_CANCEL') {
+    handleWebEposScrapeCancel(message.requestId, sender?.tab?.id)
+      .then((r) => sendResponse(r || { ok: false }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
   if (message.type === 'NOSPOS_PAGE_READY') {
     handleNosposPageReady(message, sender)
       .then(() => sendResponse({ ok: true }))

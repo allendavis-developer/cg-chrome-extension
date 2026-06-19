@@ -27,6 +27,13 @@ async function handleBridgeAction_reopenWebEposUpload({ requestId, appTabId, pay
   const url = normalizeWebEposUploadUrl(payload.url);
   await clearWebEposUploadSession();
   const { tabId: webeposTabId } = await ensureWebEposUploadWorkerTabOpen(url, appTabId);
+  // Re-seed the shop hints so the products panel can show/flag Cash EPOS vs
+  // NosPos vs Web EPOS (cleared above; preflight just re-confirmed the shop).
+  await writeWebEposUploadSession({
+    nosposShop: preflight.nosposShop || null,
+    expectedShopMatch: expectedShopMatch || null,
+    expectedCgShopName: expectedCgShopName || null,
+  });
   const pending = await getPending();
   const entry = { appTabId, listingTabId: webeposTabId, type: 'openWebEposUpload' };
   pending[requestId] = entry;

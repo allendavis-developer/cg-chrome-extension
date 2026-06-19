@@ -16,11 +16,13 @@ async function handleBridgeAction_openWebEposProductCreateForUpload({ requestId,
     return { ok: false, error: 'No app tab' };
   }
 
+  const targetStore = await resolveWebEposTargetStore(payload?.targetStore);
   void openWebEposProductCreateMinimizedAndRespond(
     requestId,
     appTabId,
     payload.webEposProductCreateList,
-    payload.uploadProgressCartKey
+    payload.uploadProgressCartKey,
+    targetStore
   );
   return { ok: true };
 }

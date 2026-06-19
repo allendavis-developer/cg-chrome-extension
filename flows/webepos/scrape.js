@@ -396,12 +396,43 @@ async function scrapeWebEposProductsTableInPageWithWait(maxWaitMs) {
       ? pagePagingTexts[0] || null
       : `${pagePagingTexts[0]} · ${pagePagingTexts.length} pages (${allRows.length} rows)`;
 
+  // Capture the store the operator has selected in the Web EPOS store filter so
+  // the app can show "Displayed products from <store> store" alongside the rows.
+  let storeId = null;
+  let storeName = null;
+  try {
+    const storeSel = document.querySelector('#storeId, select[name="storeId"]');
+    if (storeSel) {
+      storeId = storeSel.value || null;
+      const opt = storeSel.selectedOptions && storeSel.selectedOptions[0];
+      storeName = opt ? String(opt.textContent || '').trim() : null;
+    }
+  } catch (_) {}
+
+  // Capture the Status filter (#status: onsale/soldout/unavailable/uploading) the
+  // list was filtered to, so the app can show "scraped from <status>" and the
+  // open-product flow can switch back to the same status before finding a row.
+  let statusValue = null;
+  let statusLabel = null;
+  try {
+    const statusSel = document.querySelector('#status, select[name="status"]');
+    if (statusSel) {
+      statusValue = statusSel.value || null;
+      const opt = statusSel.selectedOptions && statusSel.selectedOptions[0];
+      statusLabel = opt ? String(opt.textContent || '').trim() : null;
+    }
+  } catch (_) {}
+
   return {
     ok: true,
     headers,
     rows: allRows,
     pagingText,
     pageUrl: typeof location !== 'undefined' ? location.href : '',
+    storeId,
+    storeName,
+    statusValue,
+    statusLabel,
   };
 }
 
@@ -415,7 +446,7 @@ async function scrapeWebEposProductsTableInPageWithWait(maxWaitMs) {
  * single canonical opener behind the `navigateWebEposProductInWorker` bridge
  * action. Keep optimisations here or in that wrapper so every caller benefits.
  */
-async function openWebEposProductInTab(appTabId, productHref, barcode) {
+async function openWebEposProductInTab(appTabId, productHref, barcode, targetStore, targetStatus) {
   const hrefRaw = String(productHref || '').trim();
   const code = String(barcode || '').trim();
   if (!hrefRaw) {
@@ -476,7 +507,48 @@ async function openWebEposProductInTab(appTabId, productHref, barcode) {
     }
     await sleep(400);
 
-    const injected = await chrome.scripting.executeScript({
+    // Filter the products list to the store the listings came from before walking
+    // it — otherwise the product may be hidden behind a different store filter.
+    // If that store isn't selectable, bail (caller closes the tab + tells the user).
+    if (targetStore && (targetStore.storeId || targetStore.storeName)) {
+      const storeSwitch = await injectWebEposSelectStoreOrFail(navTabId, targetStore);
+      if (!storeSwitch.ok) {
+        await chrome.tabs.remove(navTabId).catch(() => {});
+        navTabId = null;
+        if (storeSwitch.notFound) {
+          return { ok: false, storeNotFound: true, error: 'Listings store not available in Web EPOS.' };
+        }
+        return { ok: false, error: storeSwitch.error || 'Could not set the Web EPOS store.' };
+      }
+    }
+
+    // Then switch to the product's status (On Sale / Sold Out / …) — Web EPOS
+    // only lists one status at a time, so without this a Sold Out item is invisible
+    // while the filter sits on On Sale. Best-effort: never fails the open.
+    if (targetStatus) {
+      await injectWebEposSelectStatusOrSkip(navTabId, targetStatus).catch(() => {});
+    }
+
+    // Find the product, cycling the Status filter on miss: Web EPOS lists one
+    // status at a time, so a Sold Out item is invisible while the filter sits on
+    // On Sale. We try the product's own status first (switched above), then walk
+    // the remaining statuses until found — this is what makes the open work for
+    // products on a non-default store/status, not just the main store.
+    let res = null;
+    const triedStatuses = new Set();
+    const upfrontStatus = String(targetStatus || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (upfrontStatus) triedStatuses.add(upfrontStatus);
+    const STATUS_CYCLE = ['onsale', 'soldout', 'unavailable', 'uploading'];
+
+    for (let findAttempt = 0; findAttempt <= STATUS_CYCLE.length; findAttempt += 1) {
+      if (findAttempt > 0) {
+        const nextStatus = STATUS_CYCLE.find((s) => !triedStatuses.has(s));
+        if (!nextStatus) break;
+        triedStatuses.add(nextStatus);
+        const sw = await injectWebEposSelectStatusOrSkip(navTabId, nextStatus).catch(() => null);
+        if (!sw || sw.noSelect) break; // no Status filter on this page → cycling can't help
+      }
+      const injected = await chrome.scripting.executeScript({
       target: { tabId: navTabId },
       func: async (fullHref, barcodeText) => {
         const MAX_PAGES = 200;
@@ -677,8 +749,12 @@ async function openWebEposProductInTab(appTabId, productHref, barcode) {
         return { ok: false, error: 'NOT_FOUND' };
       },
       args: [hrefRaw, code],
-    });
-    const res = injected && injected[0] ? injected[0].result : null;
+      });
+      res = injected && injected[0] ? injected[0].result : null;
+      if (res && res.ok) break;
+      // Stop on a real error (login/etc.); keep cycling only on NOT_FOUND.
+      if (res && res.error && res.error !== 'NOT_FOUND') break;
+    }
     if (!res || !res.ok) {
       if (navTabId != null) {
         await chrome.tabs.remove(navTabId).catch(() => {});
@@ -717,8 +793,24 @@ async function openWebEposProductInTab(appTabId, productHref, barcode) {
  * benefit every caller.
  */
 async function navigateWebEposProductInWorkerForBridge(appTabId, productHref, barcode, options = {}) {
-  const opened = await openWebEposProductInTab(appTabId, productHref, barcode);
-  if (!opened.ok) return { ok: false, error: opened.error };
+  // Web EPOS always loads with the first store selected, so a product that lives
+  // under a different store won't be in the list until we switch. Pre-filter to
+  // the store the snapshot came from (resolved by the caller: payload store or
+  // the scrape's persisted store) before walking the list to find the product.
+  // Same idea for the product's status (the list only shows one status at a time).
+  const opened = await openWebEposProductInTab(
+    appTabId,
+    productHref,
+    barcode,
+    options.targetStore || null,
+    options.targetStatus || null,
+  );
+  if (!opened.ok) {
+    if (opened.storeNotFound) {
+      return { ok: false, error: webEposStoreNotAvailableMessage(options.targetStore) };
+    }
+    return { ok: false, error: opened.error };
+  }
 
   if (options.focusOnSuccess !== false) {
     try {
@@ -732,6 +824,76 @@ async function navigateWebEposProductInWorkerForBridge(appTabId, productHref, ba
   return { ok: true, tabId: opened.tabId };
 }
 
+/**
+ * Send WEBEPOS_WAITING_FOR_DATA to the Web EPOS worker tab so its content script
+ * shows the "filter then allow" panel. Retries because the content script may not
+ * be ready the instant the products page finishes loading. Mirrors the eBay
+ * `sendWaitingForData` handshake.
+ */
+async function sendWebEposWaitingForData(tabId, requestId, storeHint, retriesLeft) {
+  const payload = {
+    type: 'WEBEPOS_WAITING_FOR_DATA',
+    requestId,
+    nosposShop: storeHint?.nosposShop || null,
+    expectedShopMatch: storeHint?.expectedShopMatch || null,
+    expectedCgShopName: storeHint?.expectedCgShopName || null,
+  };
+  try {
+    await chrome.tabs.sendMessage(tabId, payload);
+    return true;
+  } catch (err) {
+    if (retriesLeft > 0) {
+      await sleep(300);
+      return sendWebEposWaitingForData(tabId, requestId, storeHint, retriesLeft - 1);
+    }
+    return false;
+  }
+}
+
+/**
+ * Reload-persistence: the Web EPOS products content script re-announces itself
+ * via WEBEPOS_PAGE_READY on every (re)load. If a scrape is still pending for that
+ * exact tab, re-send WEBEPOS_WAITING_FOR_DATA so the filter/allow panel comes
+ * back — the operator can reload the page (or apply a filter that reloads it)
+ * without losing the panel. Mirrors handleListingPageReady for the CeX/eBay flow.
+ */
+async function handleWebEposPageReady(senderTabId) {
+  if (senderTabId == null) return { ok: false };
+  const pending = await getPending();
+  let requestId = null;
+  for (const [rid, entry] of Object.entries(pending)) {
+    if (
+      entry &&
+      entry.type === 'webEposScrape' &&
+      Number(entry.listingTabId) === Number(senderTabId)
+    ) {
+      requestId = rid;
+      break;
+    }
+  }
+  if (!requestId) return { ok: false };
+  const session = await readWebEposUploadSession();
+  await sendWebEposWaitingForData(
+    senderTabId,
+    requestId,
+    {
+      nosposShop: session?.nosposShop || null,
+      expectedShopMatch: session?.expectedShopMatch || null,
+      expectedCgShopName: session?.expectedCgShopName || null,
+    },
+    4
+  );
+  return { ok: true };
+}
+
+/**
+ * Step 1 of the product scrape: instead of scraping immediately, navigate the
+ * worker tab to the products page and ask its content script to show the
+ * filter/allow panel. The actual scrape happens in `handleWebEposScrapeConfirm`
+ * once the operator clicks "Get these products". This mirrors the eBay flow
+ * (LISTING_PAGE_READY → WAITING_FOR_DATA → user confirms → SCRAPED_DATA) so the
+ * operator can filter to the right store before any data leaves the page.
+ */
 async function scrapeWebEposProductsAndRespond(requestId, appTabId) {
   const respondErr = async (msg) => {
     if (!appTabId) return;
@@ -790,6 +952,67 @@ async function scrapeWebEposProductsAndRespond(requestId, appTabId) {
       return;
     }
     await sleep(400);
+
+    // Bring the Web EPOS tab to the foreground so the operator lands on it and
+    // can filter the products list — mirrors how the CeX flow focuses the tab it
+    // opens. Focus is handed back to the app once they hit "Get these products"
+    // (handleWebEposScrapeConfirm) or Cancel (handleWebEposScrapeCancel).
+    try {
+      const wt = await chrome.tabs.get(tabId);
+      await chrome.tabs.update(tabId, { active: true });
+      if (wt.windowId != null) {
+        await chrome.windows.update(wt.windowId, { focused: true });
+      }
+    } catch (_) {}
+
+    // Register the pending scrape, then ask the content script to show the
+    // filter/allow panel. We deliberately do NOT respond to the app yet — the
+    // app keeps waiting until the operator confirms (or cancels) on Web EPOS.
+    const pending = await getPending();
+    pending[requestId] = { appTabId, listingTabId: tabId, type: 'webEposScrape' };
+    await setPending(pending);
+
+    const sent = await sendWebEposWaitingForData(
+      tabId,
+      requestId,
+      {
+        nosposShop: session.nosposShop || null,
+        expectedShopMatch: session.expectedShopMatch || null,
+        expectedCgShopName: session.expectedCgShopName || null,
+      },
+      8
+    );
+    if (!sent) {
+      await clearPendingRequest(requestId);
+      await respondErr('Could not show the product picker on the Web EPOS tab.');
+      return;
+    }
+  } catch (e) {
+    await clearPendingRequest(requestId).catch(() => {});
+    await respondErr(e?.message || 'Failed to load Web EPOS products.');
+  }
+}
+
+/**
+ * Step 2: the operator clicked "Get these products" on the Web EPOS panel.
+ * Scrape the (now filtered) products table and respond to the app, then close
+ * the worker tab. Sender-tab is validated against the pending entry so a stray
+ * message can't trigger a scrape of the wrong tab.
+ */
+async function handleWebEposScrapeConfirm(requestId, senderTabId) {
+  const pending = await getPending();
+  const entry = pending[requestId];
+  if (!entry || entry.type !== 'webEposScrape') return { ok: false };
+  const appTabId = entry.appTabId;
+  const tabId = entry.listingTabId;
+  if (senderTabId != null && Number(senderTabId) !== Number(tabId)) {
+    return { ok: false };
+  }
+  // Remove the pending entry up-front so a double-click can't scrape twice.
+  delete pending[requestId];
+  await setPending(pending);
+
+  try {
     const injected = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
@@ -798,16 +1021,35 @@ async function scrapeWebEposProductsAndRespond(requestId, appTabId) {
     });
     const payload = injected && injected[0] ? injected[0].result : null;
     if (!payload || !payload.ok) {
-      await respondErr(payload?.error || 'Could not read products from Web EPOS.');
-      return;
+      await notifyAppExtensionResponse(appTabId, requestId, {
+        ok: false,
+        error: payload?.error || 'Could not read products from Web EPOS.',
+      });
+      await focusAppTab(appTabId);
+      return { ok: false };
     }
+    // NosPos navbar shop label captured at upload-session open (preflight). The
+    // app persists it as the product's NosPos store alongside the Web EPOS store.
+    let nosposShop = null;
+    try {
+      const sPre = await readWebEposUploadSession();
+      nosposShop = (sPre && sPre.nosposShop) || null;
+    } catch (_) {}
     await notifyAppExtensionResponse(appTabId, requestId, {
       ok: true,
       headers: payload.headers,
       rows: payload.rows,
       pagingText: payload.pagingText,
       pageUrl: payload.pageUrl,
+      storeId: payload.storeId || null,
+      storeName: payload.storeName || null,
+      statusValue: payload.statusValue || null,
+      statusLabel: payload.statusLabel || null,
+      nosposShop,
     });
+    // Operator hit "Get these products" — return them to Cash EPOS, same as the
+    // CeX flow focuses the app tab after SCRAPED_DATA.
+    await focusAppTab(appTabId);
     try {
       const s2 = await readWebEposUploadSession();
       const lastUrl = payload.pageUrl || s2?.lastUrl || WEB_EPOS_PRODUCTS_URL;
@@ -816,11 +1058,49 @@ async function scrapeWebEposProductsAndRespond(requestId, appTabId) {
           workerTabId: null,
           appTabId,
           lastUrl,
+          nosposShop: s2.nosposShop || null,
+          // Remember the store the listings came from so later audit/upload flows
+          // can switch Web EPOS back to it (backup for the store the app also
+          // passes explicitly in the action payload).
+          scrapedStoreId: payload.storeId || null,
+          scrapedStoreName: payload.storeName || null,
         });
       }
       await removeWebEposWorkerByTabId(tabId);
     } catch (_) {}
+    return { ok: true };
   } catch (e) {
-    await respondErr(e?.message || 'Failed to load Web EPOS products.');
+    await notifyAppExtensionResponse(appTabId, requestId, {
+      ok: false,
+      error: e?.message || 'Failed to read Web EPOS products.',
+    });
+    await focusAppTab(appTabId);
+    return { ok: false };
   }
+}
+
+/**
+ * Step 2 (alt): the operator dismissed the panel without allowing. Tell the app
+ * the sync was cancelled; leave the worker tab open so a retry can reuse it.
+ */
+async function handleWebEposScrapeCancel(requestId, senderTabId) {
+  const pending = await getPending();
+  const entry = pending[requestId];
+  if (!entry || entry.type !== 'webEposScrape') return { ok: false };
+  const appTabId = entry.appTabId;
+  const tabId = entry.listingTabId;
+  if (senderTabId != null && Number(senderTabId) !== Number(tabId)) {
+    return { ok: false };
+  }
+  delete pending[requestId];
+  await setPending(pending);
+  await notifyAppExtensionResponse(appTabId, requestId, {
+    ok: false,
+    cancelled: true,
+    error: 'Product sync cancelled.',
+  });
+  // Cancelling also returns focus to Cash EPOS; the Web EPOS tab is left open so
+  // a retry can reuse it.
+  await focusAppTab(appTabId);
+  return { ok: true };
 }

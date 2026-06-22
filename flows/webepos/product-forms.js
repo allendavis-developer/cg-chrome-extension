@@ -91,21 +91,44 @@ async function injectWebEposSelectStoreOrFail(tabId, targetStore) {
         if (t.length > 3 && t.lastIndexOf(' cg') === t.length - 3) t = t.slice(0, -3).trim();
         return t;
       };
-      const opts = Array.prototype.slice.call(sel.options || []);
-      let match = null;
-      if (wantId) match = opts.find((o) => String(o.value) === wantId) || null;
-      if (!match && wantName) {
-        const want = norm(wantName);
-        match =
-          opts.find((o) => norm(o.textContent) === want) ||
-          opts.find((o) => {
-            const n = norm(o.textContent);
-            return n && (n.indexOf(want) !== -1 || want.indexOf(n) !== -1);
-          }) ||
-          null;
+      const findMatchOption = () => {
+        const opts = Array.prototype.slice.call(sel.options || []);
+        if (wantId) {
+          const byId = opts.find((o) => String(o.value) === wantId);
+          if (byId) return byId;
+        }
+        if (wantName) {
+          const want = norm(wantName);
+          return (
+            opts.find((o) => norm(o.textContent) === want) ||
+            opts.find((o) => {
+              const n = norm(o.textContent);
+              return n && (n.indexOf(want) !== -1 || want.indexOf(n) !== -1);
+            }) ||
+            null
+          );
+        }
+        return null;
+      };
+      // The store <select> is populated by React after the page loads; on a
+      // backgrounded worker tab (Web EPOS opens unfocused) that hydration lags,
+      // so a one-shot lookup can miss an option that's about to appear and wrongly
+      // report the store as "not in the list" — the false "Couldn't set Web EPOS
+      // to <store>" toast the operator saw while the panel's own poller selected
+      // it fine a beat later. Wait for the wanted option to show up before giving
+      // up. MutationObserver-driven (not setTimeout, which is throttled to ≥1s in
+      // an unfocused tab) so it still fires while the tab is in the background.
+      let match = findMatchOption();
+      if (!match) {
+        await waitForDomCondition(() => !!findMatchOption(), 8000);
+        match = findMatchOption();
       }
       if (!match) {
-        return { ok: false, notFound: true, options: opts.map((o) => String(o.textContent || '').trim()) };
+        return {
+          ok: false,
+          notFound: true,
+          options: Array.prototype.slice.call(sel.options || []).map((o) => String(o.textContent || '').trim()),
+        };
       }
       if (String(sel.value) === String(match.value)) {
         return { ok: true, selected: String(match.textContent || '').trim(), value: match.value, alreadySelected: true };

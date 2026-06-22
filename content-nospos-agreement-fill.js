@@ -838,6 +838,54 @@
     return Array.from(sel.options).find((o) => String(o.value).trim() === id) || null;
   }
 
+  /**
+   * Resolve as soon as `produce()` returns a truthy value, re-checking on every
+   * DOM mutation instead of on a timer. This is the fix for park failing when the
+   * operator switches tab / Chrome window / Windows virtual desktop: Chrome
+   * throttles setTimeout/setInterval in a backgrounded tab (to ~1/sec when hidden,
+   * ~1/min after ~5 min of being hidden), so the old setTimeout poll loops barely
+   * ticked and timed out before NosPos finished rendering the row — surfacing as
+   * "Category field not found for line N". MutationObserver callbacks are NOT
+   * timer-throttled, so this fires the instant the <select> / its <option>s
+   * appear, even while the tab is in the background. Returns the produced value,
+   * or null if `timeoutMs` elapses. (The timeout itself rides setTimeout, so under
+   * throttling it errs toward waiting *longer* before giving up — the safe
+   * direction; the keep-alive Web Lock is what stops the page being fully frozen
+   * so these mutations keep happening at all.)
+   */
+  function waitForDomValue(produce, timeoutMs) {
+    return new Promise((resolve) => {
+      let done = false;
+      let obs = null;
+      let to = null;
+      const settle = (value) => {
+        if (done) return;
+        done = true;
+        try { if (obs) obs.disconnect(); } catch (_) {}
+        if (to) clearTimeout(to);
+        resolve(value);
+      };
+      const tryNow = () => {
+        if (done) return;
+        let v = null;
+        try { v = produce(); } catch (_) { v = null; }
+        if (v) settle(v);
+      };
+      obs = new MutationObserver(tryNow);
+      to = setTimeout(() => settle(null), Math.max(100, timeoutMs));
+      try {
+        obs.observe(document.documentElement, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          characterData: true,
+        });
+      } catch (_) {}
+      // Check once synchronously in case the target is already present.
+      tryNow();
+    });
+  }
+
   async function runCategoryPhase(categoryId, lineIndex) {
     const lineIdx = Math.max(0, parseInt(String(lineIndex ?? '0'), 10) || 0);
     const id = String(categoryId ?? '').trim();
@@ -847,11 +895,9 @@
     if (!sel) {
       // Wait for the row's <select> to render rather than failing immediately —
       // a backgrounded tab finishes its reload more slowly than a focused one.
-      const deadline = Date.now() + CATEGORY_SELECT_WAIT_MS;
-      while (!sel && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 200));
-        sel = nthItemCategorySelect(lineIdx);
-      }
+      // Observer-driven (not a setTimeout poll) so it still fires when the tab is
+      // backgrounded, where timers are throttled to ~1/sec (~1/min after 5 min).
+      sel = await waitForDomValue(() => nthItemCategorySelect(lineIdx), CATEGORY_SELECT_WAIT_MS);
     }
     if (!sel) {
       logToBackground('runCategoryPhase', 'error', { lineIndex: lineIdx, totalSelects: listCategorySelects().length, waitedMs: CATEGORY_SELECT_WAIT_MS }, 'Category select not found for line after wait');
@@ -862,11 +908,8 @@
     // errors on rapidly-added lines: the option is there, just not rendered yet.
     let opt = findCategoryOptionById(sel, id);
     if (!opt && id) {
-      const deadline = Date.now() + CATEGORY_OPTION_WAIT_MS;
-      while (!opt && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 150));
-        opt = findCategoryOptionById(sel, id);
-      }
+      // Same throttle-proof observer wait for the option list to populate.
+      opt = await waitForDomValue(() => findCategoryOptionById(sel, id), CATEGORY_OPTION_WAIT_MS);
     }
     if (!opt && id) {
       // Capture what WAS in the dropdown so a genuine absence (wrong row / a category
@@ -945,7 +988,6 @@
    * NosPos / Yii often uses SweetAlert after data-confirm — confirm so the POST runs.
    */
   async function confirmDeleteDialogIfPresent(maxMs) {
-    const deadline = Date.now() + Math.max(500, maxMs);
     const selectors = [
       '.swal2-confirm',
       'button.swal2-confirm',
@@ -956,17 +998,22 @@
       '.modal.in .btn-danger',
       '.modal.show .btn-danger',
     ];
-    while (Date.now() < deadline) {
+    const findConfirmBtn = () => {
       for (let si = 0; si < selectors.length; si++) {
         const btn = document.querySelector(selectors[si]);
-        if (btn && typeof btn.click === 'function') {
-          log('confirm delete dialog', selectors[si]);
-          btn.click();
-          await new Promise((r) => setTimeout(r, 120));
-          return { confirmed: true };
-        }
+        if (btn && typeof btn.click === 'function') return btn;
       }
-      await new Promise((r) => setTimeout(r, 60));
+      return null;
+    };
+    // Observer-driven so the confirm dialog is caught the instant it renders even
+    // when the tab is backgrounded — a setTimeout poll would be throttled to
+    // ~1/sec (~1/min after 5 min) and could miss the OK button for the whole park.
+    const btn = findConfirmBtn() || (await waitForDomValue(findConfirmBtn, Math.max(500, maxMs)));
+    if (btn) {
+      log('confirm delete dialog');
+      btn.click();
+      await new Promise((r) => setTimeout(r, 120));
+      return { confirmed: true };
     }
     return { confirmed: false };
   }
@@ -1120,14 +1167,15 @@
     }
     logToBackground('runSidebarParkAgreement', 'step', {}, 'Opening Actions dropdown in agreement card');
     openActionsDropdownInCard(card);
-    await new Promise((r) => setTimeout(r, 280));
-    parkLink = findSidebarAgreementParkLink();
+    // Observer-driven wait for the Park link to render after the dropdown opens,
+    // instead of a fixed throttled setTimeout — a backgrounded tab renders the
+    // dropdown menu slower, and this is the final, must-not-fail park step.
+    parkLink = findSidebarAgreementParkLink() || (await waitForDomValue(findSidebarAgreementParkLink, 2500));
     logToBackground('runSidebarParkAgreement', 'step', { parkLinkFound: !!parkLink, parkLinkHref: parkLink?.getAttribute('href') }, 'Park link search after 1st Actions open');
     if (!parkLink) {
       logToBackground('runSidebarParkAgreement', 'step', {}, 'Park link not found — retrying Actions open');
       openActionsDropdownInCard(card);
-      await new Promise((r) => setTimeout(r, 280));
-      parkLink = findSidebarAgreementParkLink();
+      parkLink = findSidebarAgreementParkLink() || (await waitForDomValue(findSidebarAgreementParkLink, 2500));
       logToBackground('runSidebarParkAgreement', 'step', { parkLinkFound: !!parkLink, parkLinkHref: parkLink?.getAttribute('href') }, 'Park link search after 2nd Actions open');
     }
     if (!parkLink) {

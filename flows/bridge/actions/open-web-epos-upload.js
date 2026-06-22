@@ -21,8 +21,15 @@ async function handleBridgeAction_openWebEposUpload({ requestId, appTabId, paylo
 
   const expectedCgShopName = payload?.expectedCgShopName || '';
   const expectedShopMatch = payload?.expectedShopMatch || '';
+  // Local-dev escape hatch: the page only sends devLocal when it's running on
+  // localhost (isLocalDev()), never on beta/prod. It lets the uploader open Web
+  // EPOS even when NosPos isn't on the matching shop — the same bypass the page
+  // applies to its own store-match gate. Without this the page proceeds past the
+  // gate but the worker tab never opens, so the scrape later fails with
+  // "No Web EPOS window for this session".
+  const devLocal = !!payload?.devLocal;
   const preflight = await nosposCheckLoginAndShop('https://nospos.com/customers', expectedCgShopName, expectedShopMatch);
-  if (!preflight.ok) {
+  if (!preflight.ok && !devLocal) {
     logUpload('openWebEposUpload', 'preflight-failed', {
       loginRequired: !!preflight.loginRequired,
       shopMismatch: !!preflight.shopMismatch,
@@ -35,6 +42,13 @@ async function handleBridgeAction_openWebEposUpload({ requestId, appTabId, paylo
       response: preflight,
     }).catch(() => {});
     return preflight;
+  }
+  if (!preflight.ok && devLocal) {
+    logUpload('openWebEposUpload', 'preflight-skipped-dev', {
+      loginRequired: !!preflight.loginRequired,
+      shopMismatch: !!preflight.shopMismatch,
+      nosposShop: preflight.nosposShop || null,
+    }, 'Local dev: NosPos preflight failed — opening Web EPOS anyway');
   }
 
   const { tabId: webeposTabId } = await ensureWebEposUploadWorkerTabOpen(

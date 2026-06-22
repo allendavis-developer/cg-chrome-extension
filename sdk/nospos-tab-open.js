@@ -3,6 +3,21 @@
  * Exports: openBackgroundNosposTab, openNosposParkAgreementTab
  */
 
+/**
+ * Stop Chrome from auto-discarding a worker tab. These tabs are deliberately
+ * opened in the background; when the operator focuses another window/tab Chrome's
+ * Memory Saver discards the inactive tab, which fires `tabs.onRemoved` for our
+ * tracked id — the flow then mistakenly reports "NosPos tab was closed" and fails
+ * every remaining line even though a tab is still visible in the strip.
+ * `autoDiscardable:false` is the direct, supported way to pin it. Best-effort.
+ */
+async function disableTabAutoDiscard(tabId) {
+  if (tabId == null) return;
+  try {
+    await chrome.tabs.update(tabId, { autoDiscardable: false });
+  } catch (_) {}
+}
+
 async function openBackgroundNosposTab(url, appTabId = null) {
   try {
     const win = await chrome.windows.create({
@@ -15,6 +30,7 @@ async function openBackgroundNosposTab(url, appTabId = null) {
     }
     const tab = (win?.tabs || [])[0];
     if (tab?.id != null) {
+      await disableTabAutoDiscard(tab.id);
       if (appTabId) {
         await focusAppTab(appTabId);
       }
@@ -34,6 +50,7 @@ async function openBackgroundNosposTab(url, appTabId = null) {
     }
     const tab = (win?.tabs || [])[0];
     if (tab?.id != null) {
+      await disableTabAutoDiscard(tab.id);
       if (appTabId) {
         await focusAppTab(appTabId);
       }
@@ -44,6 +61,7 @@ async function openBackgroundNosposTab(url, appTabId = null) {
   }
 
   const fallbackTab = await chrome.tabs.create({ url, active: false });
+  await disableTabAutoDiscard(fallbackTab.id);
   await putTabInYellowGroup(fallbackTab.id);
   if (appTabId) {
     await focusAppTab(appTabId);
@@ -80,6 +98,7 @@ async function openWebEposWorkerTab(url, appTabId = null) {
   const createOpts = { url, active: false };
   if (windowId != null) createOpts.windowId = windowId;
   const newTab = await chrome.tabs.create(createOpts);
+  await disableTabAutoDiscard(newTab.id);
   await putTabInYellowGroup(newTab.id);
   if (appTabId) {
     await focusAppTab(appTabId);
@@ -115,6 +134,7 @@ async function openNosposParkAgreementTab(url, appTabId = null) {
   if (windowId != null) createOpts.windowId = windowId;
   logPark('openNosposParkAgreementTab', 'call', { createOpts }, 'Calling chrome.tabs.create');
   const newTab = await chrome.tabs.create(createOpts);
+  await disableTabAutoDiscard(newTab.id);
   await putTabInYellowGroup(newTab.id);
   if (appTabId) {
     await focusAppTab(appTabId);

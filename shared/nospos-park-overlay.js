@@ -12,7 +12,45 @@
   var DEFAULT_MSG =
     'CG Suite is updating this agreement — please wait. Do not use this tab until finished.';
 
+  // --- Background-throttle keep-alive ----------------------------------------
+  // When this NosPos tab is backgrounded, Chrome throttles its timers and can
+  // effectively pause page JS — which stalls the park flow ("does nothing unless
+  // you're looking at it"). Keeping a Web Audio context running marks the tab as
+  // processing audio, which exempts it from that throttling so a park completes
+  // even while the operator works in another tab. Gain is essentially silent.
+  var cgKeepAliveCtx = null;
+  var cgKeepAliveOsc = null;
+  function startParkKeepAlive() {
+    if (cgKeepAliveCtx) return;
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      var ctx = new AC();
+      var gain = ctx.createGain();
+      gain.gain.value = 0.0001; // inaudible, but registers as audio output
+      var osc = ctx.createOscillator();
+      osc.frequency.value = 20; // sub-audible
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      // Programmatically-opened tabs may start suspended; try to resume (operators
+      // use nospos.com constantly, so its media-engagement usually allows this).
+      if (ctx.state === 'suspended' && typeof ctx.resume === 'function') {
+        ctx.resume().catch(function () {});
+      }
+      cgKeepAliveCtx = ctx;
+      cgKeepAliveOsc = osc;
+    } catch (_) {}
+  }
+  function stopParkKeepAlive() {
+    try { if (cgKeepAliveOsc) cgKeepAliveOsc.stop(); } catch (_) {}
+    try { if (cgKeepAliveCtx && cgKeepAliveCtx.close) cgKeepAliveCtx.close(); } catch (_) {}
+    cgKeepAliveOsc = null;
+    cgKeepAliveCtx = null;
+  }
+
   function showParkLoadingOverlay(message) {
+    startParkKeepAlive(); // keep the tab un-throttled while the park is running
     var text = (message && String(message).trim()) || DEFAULT_MSG;
     var existing = document.getElementById(OVERLAY_ID);
     if (existing) {
@@ -67,6 +105,7 @@
   }
 
   function removeParkLoadingOverlay() {
+    stopParkKeepAlive();
     var overlay = document.getElementById(OVERLAY_ID);
     if (overlay) overlay.remove();
     var styleEl = document.getElementById(STYLE_ID);

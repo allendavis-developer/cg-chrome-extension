@@ -14,8 +14,10 @@ async function handleBridgeAction_reopenWebEposUpload({ requestId, appTabId, pay
 
   const expectedCgShopName = payload?.expectedCgShopName || '';
   const expectedShopMatch = payload?.expectedShopMatch || '';
+  // Local-dev escape hatch (see open-web-epos-upload.js): only sent on localhost.
+  const devLocal = !!payload?.devLocal;
   const preflight = await nosposCheckLoginAndShop('https://nospos.com/customers', expectedCgShopName, expectedShopMatch);
-  if (!preflight.ok) {
+  if (!preflight.ok && !devLocal) {
     chrome.tabs.sendMessage(appTabId, {
       type: 'EXTENSION_RESPONSE_TO_PAGE',
       requestId,

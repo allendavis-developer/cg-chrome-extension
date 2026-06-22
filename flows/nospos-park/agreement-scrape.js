@@ -179,17 +179,19 @@ async function waitForAgreementItemsPageSettled(tabId, maxWaitMs = NOSPOS_RELOAD
 }
 
 /** Navigate the items page to a 1-based page number and wait for it to settle. */
-async function navigateNosposAgreementToPage(tabId, pageNum) {
+async function navigateNosposAgreementToPage(tabId, pageNum, force = false) {
   const r = await sendParkMessageToTabWithAbort(
     tabId,
-    { type: 'NOSPOS_AGREEMENT_FILL_PHASE', phase: 'nav_to_page', pageNum },
+    { type: 'NOSPOS_AGREEMENT_FILL_PHASE', phase: 'nav_to_page', pageNum, force: !!force },
     8,
     350
   );
   if (!r?.ok) {
     return { ok: false, error: r?.error || 'Could not navigate NoSpos items pager' };
   }
-  if (r.navigated) {
+  // `force` always reloads (even if the page thought it was already there), so wait
+  // for it to settle in that case too — otherwise we'd count rows on a stale page.
+  if (r.navigated || force) {
     await waitForAgreementItemsPageReload(tabId, `pager → page ${pageNum}`, NOSPOS_RELOAD_WAIT_MS);
     const settled = await waitForAgreementItemsPageSettled(tabId);
     if (!settled.ok) return settled;
@@ -327,7 +329,29 @@ async function addNosposAgreementItemAndResolveRow(tabId, globalTargetIndex) {
       // (e.g. `items-page=25#agreement-item-…`, where 25 is an item ordinal, not a page) or a
       // "last page" guess. navigateNosposAgreementToPage clicks the real pager link (or falls
       // back to ?items-page=N), so it lands on the actual page even from the noisy URL.
-      const navp = await navigateNosposAgreementToPage(tabId, expectedPage);
+      let navp = await navigateNosposAgreementToPage(tabId, expectedPage);
+      // Confirm we actually landed on expectedPage before counting. The noisy
+      // post-Add URL can make the in-page pager mis-report the active page, so the
+      // first nav may have no-op'd ("already there") leaving us on page 1 — then
+      // we'd count page 1's 20 rows and wrongly conclude the Add failed. This is the
+      // "Add on page 2 → jumps to page 1, the 2nd+ item on a page fails" bug. If we
+      // aren't where we expect (and that page exists), force a real navigation.
+      if (navp.ok && expectedPage > 1) {
+        const pagerNow = await readNosposAgreementPager(tabId);
+        if (
+          pagerNow.ok &&
+          pagerNow.lastPage >= expectedPage &&
+          pagerNow.currentPage !== expectedPage
+        ) {
+          logPark(
+            'addNosposAgreementItemAndResolveRow',
+            'step',
+            { expectedPage, actualPage: pagerNow.currentPage, lastPage: pagerNow.lastPage, attempt },
+            'Not on expected page after Add — forcing a real navigation before counting'
+          );
+          navp = await navigateNosposAgreementToPage(tabId, expectedPage, true);
+        }
+      }
       if (navp.ok) {
         const count = await countNosposAgreementItemLines(tabId);
         if (count >= expectedIndexInPage + 1) {

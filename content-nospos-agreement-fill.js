@@ -225,10 +225,14 @@
    * Navigate the items page to a 1-based page number. Prefers the real pager link's href
    * (keeps NosPos' own query args); falls back to setting `?page=N` on the current URL.
    */
-  function runNavigateAgreementToPage(pageNum) {
+  function runNavigateAgreementToPage(pageNum, force) {
     const want = Math.max(1, parseInt(String(pageNum), 10) || 1);
     const cur = runReadAgreementPager();
-    if (cur.currentPage === want) return { ok: true, navigated: false, alreadyThere: true };
+    // `force` skips the "already on this page" shortcut. After a post-Add redirect
+    // (items-page=<item ordinal>) the in-page pager can momentarily mis-report the
+    // active page, so the caller needs a way to demand a real navigation + reload
+    // even when we appear to already be there.
+    if (!force && cur.currentPage === want) return { ok: true, navigated: false, alreadyThere: true };
     const ul = findAgreementPagerEl();
     if (ul) {
       const links = Array.from(ul.querySelectorAll('li a'));
@@ -816,18 +820,67 @@
     return { ready: true, debug };
   }
 
-  function runCategoryPhase(categoryId, lineIndex) {
+  /** NosPos can render a freshly-added row before that row's category <select>
+   *  finishes populating its <option> list. A one-shot check then falsely reports
+   *  the wanted category as "not in the dropdown" (the option arrives a beat later).
+   *  Poll the option list for up to this long before giving up. */
+  const CATEGORY_OPTION_WAIT_MS = 4000;
+
+  /** A freshly-added row's category <select> can lag behind the page "load" event,
+   *  especially when the NosPos tab is in the BACKGROUND (the operator switched
+   *  tabs / desktops): the reload renders slower, so a one-shot lookup misses the
+   *  element and the line falsely fails with "Category field not found". Poll for
+   *  the select to appear before giving up — same idea as the option wait below. */
+  const CATEGORY_SELECT_WAIT_MS = 12000;
+
+  function findCategoryOptionById(sel, id) {
+    if (!sel || !id) return null;
+    return Array.from(sel.options).find((o) => String(o.value).trim() === id) || null;
+  }
+
+  async function runCategoryPhase(categoryId, lineIndex) {
     const lineIdx = Math.max(0, parseInt(String(lineIndex ?? '0'), 10) || 0);
-    log('phase category', categoryId, 'line', lineIdx);
-    logToBackground('runCategoryPhase', 'enter', { categoryId, lineIndex: lineIdx, url: window.location.href }, `Setting category ${categoryId} on line ${lineIdx}`);
-    const sel = nthItemCategorySelect(lineIdx);
+    const id = String(categoryId ?? '').trim();
+    log('phase category', id, 'line', lineIdx);
+    logToBackground('runCategoryPhase', 'enter', { categoryId: id, lineIndex: lineIdx, url: window.location.href }, `Setting category ${id} on line ${lineIdx}`);
+    let sel = nthItemCategorySelect(lineIdx);
     if (!sel) {
-      logToBackground('runCategoryPhase', 'error', { lineIndex: lineIdx, totalSelects: listCategorySelects().length }, 'Category select not found for line');
+      // Wait for the row's <select> to render rather than failing immediately —
+      // a backgrounded tab finishes its reload more slowly than a focused one.
+      const deadline = Date.now() + CATEGORY_SELECT_WAIT_MS;
+      while (!sel && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 200));
+        sel = nthItemCategorySelect(lineIdx);
+      }
+    }
+    if (!sel) {
+      logToBackground('runCategoryPhase', 'error', { lineIndex: lineIdx, totalSelects: listCategorySelects().length, waitedMs: CATEGORY_SELECT_WAIT_MS }, 'Category select not found for line after wait');
       return { ok: false, error: 'Category field not found for line ' + lineIdx };
     }
-    logToBackground('runCategoryPhase', 'step', { lineIndex: lineIdx, currentValue: sel.value, wantedCategoryId: categoryId }, 'Category select found — setting value');
-    const result = setCategorySelect(sel, categoryId);
-    logToBackground('runCategoryPhase', 'exit', { result, lineIndex: lineIdx, categoryId }, 'setCategorySelect result');
+    // Wait briefly for the option list to populate before deciding the id is absent.
+    // This is what fixes the false "Category id N is not in the NoSpos dropdown"
+    // errors on rapidly-added lines: the option is there, just not rendered yet.
+    let opt = findCategoryOptionById(sel, id);
+    if (!opt && id) {
+      const deadline = Date.now() + CATEGORY_OPTION_WAIT_MS;
+      while (!opt && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 150));
+        opt = findCategoryOptionById(sel, id);
+      }
+    }
+    if (!opt && id) {
+      // Capture what WAS in the dropdown so a genuine absence (wrong row / a category
+      // list that really doesn't include this id) can be told apart from a slow-load
+      // race that outlasted the wait. Shows up in the park log on the next failure.
+      const optionsSample = Array.from(sel.options)
+        .slice(0, 60)
+        .map((o) => ({ v: String(o.value), t: String(o.textContent || '').trim() }));
+      logToBackground('runCategoryPhase', 'error', { lineIndex: lineIdx, wantedCategoryId: id, optionCount: sel.options.length, optionsSample, waitedMs: CATEGORY_OPTION_WAIT_MS }, `Category id ${id} not in dropdown after ${CATEGORY_OPTION_WAIT_MS}ms wait`);
+      return { ok: false, error: `Category id ${id} is not in the NoSpos dropdown for this item`, optionCount: sel.options.length };
+    }
+    logToBackground('runCategoryPhase', 'step', { lineIndex: lineIdx, currentValue: sel.value, wantedCategoryId: id, optionCount: sel.options.length }, 'Category option found — setting value');
+    const result = setCategorySelect(sel, id);
+    logToBackground('runCategoryPhase', 'exit', { result, lineIndex: lineIdx, categoryId: id }, 'setCategorySelect result');
     return result;
   }
 
@@ -1396,8 +1449,9 @@
         sendResponse({ ok: false, error: 'Missing category id' });
         return true;
       }
-      const r = runCategoryPhase(categoryId, msg.lineIndex);
-      sendResponse(r.ok ? r : { ok: false, error: r.error });
+      runCategoryPhase(categoryId, msg.lineIndex)
+        .then((r) => sendResponse(r.ok ? r : { ok: false, error: r.error, ...r }))
+        .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }));
       return true;
     }
 
@@ -1408,7 +1462,9 @@
           sendResponse({ ok: false, error: 'Missing category id' });
           return true;
         }
-        sendResponse(runCategoryPhase(categoryId, msg.lineIndex));
+        runCategoryPhase(categoryId, msg.lineIndex)
+          .then(sendResponse)
+          .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }));
         return true;
       }
       if (msg.phase === 'probe_rest_ready') {
@@ -1425,7 +1481,7 @@
         return true;
       }
       if (msg.phase === 'nav_to_page') {
-        sendResponse(runNavigateAgreementToPage(msg.pageNum));
+        sendResponse(runNavigateAgreementToPage(msg.pageNum, msg.force === true));
         return true;
       }
       if (msg.phase === 'click_add') {

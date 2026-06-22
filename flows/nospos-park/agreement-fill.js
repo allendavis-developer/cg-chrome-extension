@@ -316,8 +316,13 @@ async function applyNosposAgreementCategoryPhaseImpl(tabId, payload) {
     }
     return { ok: true, categoryLabel, waitForm, lineIndex };
   } catch (e) {
-    logPark('applyNosposAgreementCategoryPhaseImpl', 'error', { error: e?.message, lineIndex, categoryId }, 'Exception in category phase');
-    return { ok: false, error: e?.message || 'Could not set category on NoSpos', lineIndex };
+    const msg = e?.message || 'Could not set category on NoSpos';
+    // The tab going away mid-category throws NOSPOS_PARK_TAB_CLOSED_ERR via
+    // sendParkMessageToTabWithAbort. Tag it so the app loop can hard-stop the
+    // whole run instead of grinding through the remaining lines on a dead tab.
+    const tabClosed = /tab was closed/i.test(msg);
+    logPark('applyNosposAgreementCategoryPhaseImpl', 'error', { error: msg, lineIndex, categoryId, tabClosed }, 'Exception in category phase');
+    return { ok: false, error: msg, lineIndex, ...(tabClosed ? { tabClosed: true } : {}) };
   }
 }
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CG Suite Research",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "Capture listing data from eBay, Cash Converters, and Cash Generator for CG Suite research forms.",
   "permissions": [
     "activeTab",
@@ -44,6 +44,11 @@
     {
       "matches": ["http://localhost/*", "https://localhost/*", "http://127.0.0.1/*", "https://127.0.0.1/*", "https://cashepos.com/*", "https://www.cashepos.com/*", "https://beta.cashepos.com/*"],
       "js": ["shared/constants.js", "content-bridge.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://nospos.com/*", "https://*.nospos.com/*"],
+      "js": ["shared/nospos-keepalive.js"],
       "run_at": "document_start"
     },
     {

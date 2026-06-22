@@ -951,6 +951,36 @@ async function scrapeWebEposProductsAndRespond(requestId, appTabId) {
       await respondErr('You must be logged into Web EPOS to view products.');
       return;
     }
+
+    // Default the Web EPOS store filter to the Cash EPOS branch the operator is
+    // on, so the products list (and any audit / upload) is scoped to the store
+    // they're working — no manual "switch store" step. Only Web EPOS is switched
+    // here; the NosPos branch is left to the operator (the openWebEposUpload
+    // preflight already gated NosPos). Non-fatal: if the branch isn't selectable
+    // we log and carry on — the page still loads and the hub's store-match gate
+    // still guards any write.
+    const cgBranch = session.expectedCgShopName || session.expectedShopMatch || '';
+    if (cgBranch) {
+      let outcome;
+      try {
+        const storeDefault = await injectWebEposSelectStoreOrFail(tabId, { storeName: cgBranch });
+        outcome = {
+          requested: cgBranch,
+          ok: !!storeDefault?.ok,
+          selected: storeDefault?.selected || null,
+          notFound: !!storeDefault?.notFound,
+          skipped: !!storeDefault?.skipped,
+        };
+        console.log('[CG Suite] Web EPOS uploader: defaulted store to Cash EPOS branch', outcome);
+      } catch (e) {
+        outcome = { requested: cgBranch, ok: false, error: e?.message || String(e) };
+        console.log('[CG Suite] Web EPOS uploader: store default failed', outcome);
+      }
+      // Stash the outcome so the scrape response (step 2) can carry it back to the
+      // page, which toasts which store Web EPOS was set to (or that it couldn't be).
+      await writeWebEposUploadSession({ storeDefault: outcome });
+    }
+
     await sleep(400);
 
     // Bring the Web EPOS tab to the foreground so the operator lands on it and
@@ -1031,9 +1061,11 @@ async function handleWebEposScrapeConfirm(requestId, senderTabId) {
     // NosPos navbar shop label captured at upload-session open (preflight). The
     // app persists it as the product's NosPos store alongside the Web EPOS store.
     let nosposShop = null;
+    let storeDefault = null;
     try {
       const sPre = await readWebEposUploadSession();
       nosposShop = (sPre && sPre.nosposShop) || null;
+      storeDefault = (sPre && sPre.storeDefault) || null;
     } catch (_) {}
     await notifyAppExtensionResponse(appTabId, requestId, {
       ok: true,
@@ -1046,6 +1078,9 @@ async function handleWebEposScrapeConfirm(requestId, senderTabId) {
       statusValue: payload.statusValue || null,
       statusLabel: payload.statusLabel || null,
       nosposShop,
+      // Outcome of defaulting the Web EPOS store filter to the Cash EPOS branch
+      // (set in step 1) — the page toasts it.
+      storeDefault,
     });
     // Operator hit "Get these products" — return them to Cash EPOS, same as the
     // CeX flow focuses the app tab after SCRAPED_DATA.
@@ -1081,7 +1116,9 @@ async function handleWebEposScrapeConfirm(requestId, senderTabId) {
 
 /**
  * Step 2 (alt): the operator dismissed the panel without allowing. Tell the app
- * the sync was cancelled; leave the worker tab open so a retry can reuse it.
+ * the sync was cancelled, return focus to Cash EPOS, and CLOSE the Web EPOS
+ * worker tab (same as a successful scrape) — cancelling should not leave a stray
+ * Web EPOS tab behind. A later Re-get reopens a fresh worker tab.
  */
 async function handleWebEposScrapeCancel(requestId, senderTabId) {
   const pending = await getPending();
@@ -1099,8 +1136,19 @@ async function handleWebEposScrapeCancel(requestId, senderTabId) {
     cancelled: true,
     error: 'Product sync cancelled.',
   });
-  // Cancelling also returns focus to Cash EPOS; the Web EPOS tab is left open so
-  // a retry can reuse it.
+  // Return focus to Cash EPOS, then close the worker tab so cancel tidies up
+  // after itself instead of leaving the Web EPOS tab open behind the app.
   await focusAppTab(appTabId);
+  try {
+    const s2 = await readWebEposUploadSession();
+    if (s2 && Number(s2.appTabId) === Number(appTabId)) {
+      await writeWebEposUploadSession({
+        workerTabId: null,
+        appTabId,
+        lastUrl: s2.lastUrl || WEB_EPOS_PRODUCTS_URL,
+      });
+    }
+    await removeWebEposWorkerByTabId(tabId);
+  } catch (_) {}
   return { ok: true };
 }

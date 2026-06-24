@@ -612,8 +612,75 @@
     { key: 'mailMarketing',  sel: '#customer-direct_mail_ok',      type: 'check'  },
   ];
 
+  // Read-only "detail view" summary NoSpos renders on every customer sub-page
+  // (/view AND /buying). Unlike the editable #customer-* inputs, these blocks
+  // are present even on pages that carry no edit form — exactly where a naive
+  // .value scrape comes back blank. Keyed by the <strong> label (e.g. "Name").
+  function scrapeCustomerDetailView() {
+    var map = {};
+    document.querySelectorAll('.detail').forEach(function (row) {
+      var strong = row.querySelector('strong');
+      if (!strong) return;
+      var label = (strong.textContent || '').trim();
+      if (!label) return;
+      var span = row.querySelector('span');
+      map[label] = span ? (span.textContent || '').trim() : '';
+    });
+    return map;
+  }
+
+  // True when the editable customer form is actually on this page. The customer
+  // panel triggers on both /customer/{id}/view and /customer/{id}/buying; the
+  // latter (and a post-save read-only /view) has no edit inputs, so a .value
+  // scrape there yields an all-blank form. Callers use this to avoid recording
+  // phantom "everything cleared" diffs and storing an empty name.
+  function customerEditFormPresent() {
+    return !!(document.querySelector('#customer-forename') ||
+              document.querySelector('#customer-surname'));
+  }
+
+  // Best-effort full name: editable inputs first (captures unsaved edits), then
+  // the read-only "Name" detail block (present even when no edit form is). Empty
+  // only when NoSpos genuinely has no name on file.
+  function resolveCustomerName(scraped) {
+    var fromInputs = ((scraped.forename || '') + ' ' + (scraped.surname || '')).trim();
+    if (fromInputs) return fromInputs;
+    var detail = scrapeCustomerDetailView();
+    return (detail['Name'] || detail['Full Name'] || detail['Customer'] || '').trim();
+  }
+
+  // The page may still be loading/reloading after a NoSpos save when Done is
+  // pressed, so a one-shot scrape can read a half-rendered (nameless) form. Poll
+  // until we can read a name — taking however long the page needs — then hand the
+  // fresh scrape to cb. Falls back to best-effort data at timeout rather than
+  // blocking forever. cb(scraped, resolvedName).
+  function waitForCustomerScrape(cb, opts) {
+    opts = opts || {};
+    var timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : 15000;
+    var intervalMs = 250;
+    var waited = 0;
+    (function poll() {
+      var scraped = scrapeCustomerForm();
+      var name = resolveCustomerName(scraped);
+      if (name || waited >= timeoutMs) {
+        cb(scraped, name);
+        return;
+      }
+      waited += intervalMs;
+      setTimeout(poll, intervalMs);
+    })();
+  }
+
   function scrapeCustomerForm() {
-    function val(sel) { var el = document.querySelector(sel); return el ? (el.value || '').trim() : ''; }
+    // Live value first (captures unsaved edits), then the server-rendered
+    // defaultValue (survives a stray .value clear) so a present-but-empty input
+    // can't silently zero out a field.
+    function val(sel) {
+      var el = document.querySelector(sel);
+      if (!el) return '';
+      var v = (el.value || '').trim();
+      return v || (el.defaultValue || '').trim();
+    }
     function isChecked(sel) { var el = document.querySelector(sel); return !!(el && el.checked); }
     var stats = scrapeCustomerStats();
     var out = { profilePicture: scrapeProfilePicture() };
@@ -825,7 +892,7 @@
     function buildCustomerPayload(after, changes) {
       var customer = Object.assign({}, after, {
         nosposCustomerId: extractNosposCustomerIdFromPath(),
-        name:    ((after.forename || '') + ' ' + (after.surname || '')).trim(),
+        name:    resolveCustomerName(after),
         phone:   after.mobile || after.homePhone,
         address: [after.address1, after.address2, after.town, after.county, after.postcode].filter(Boolean).join(', '),
       });
@@ -854,9 +921,23 @@
       cancelBtn.style.opacity = '0.5';
       showPanelError('');
 
-      var after = scrapeCustomerForm();
-      var changes = diffSnapshot(snapshot, after);
+      // Wait for the page to actually have data before scraping — it may still be
+      // reloading after a save. Take however long it needs (capped), then scrape.
+      waitForCustomerScrape(function (after) {
+      var formPresent = customerEditFormPresent();
+      // If the edit form isn't on this page (we're on /buying, or a read-only
+      // /view), the .value scrape is an all-blank form and any diff against the
+      // persisted snapshot is a phantom "everything cleared". Don't record those
+      // changes — keep only what we can read reliably (name via the .detail
+      // block). This is the bug behind the "11 changes, all → empty" reports.
+      var changes = formPresent ? diffSnapshot(snapshot, after) : [];
       var customer = buildCustomerPayload(after, changes);
+
+      // Last-resort name: the pre-edit originals snapshot captured when the form
+      // was present. resolveCustomerName already tried inputs + the detail block.
+      if (!customer.name && snapshot) {
+        customer.name = ((snapshot.forename || '') + ' ' + (snapshot.surname || '')).trim();
+      }
 
       // Shortcut: if the live form already matches NoSpos's saved baseline
       // (`.value === defaultValue` for every diff field) the user already
@@ -926,6 +1007,7 @@
       window.addEventListener('beforeunload', onBeforeUnload);
 
       saveBtn.click();
+      }); // end waitForCustomerScrape callback
     });
 
     cancelBtn.addEventListener('click', function () {
@@ -1045,23 +1127,26 @@
       doneBtn.style.opacity = '0.7';
       doneBtn.textContent = 'Returning…';
 
-      var customer = scrapeCustomerForm();
-      customer.nosposCustomerId = extractNosposCustomerIdFromPath();
-      customer.name = ((customer.forename || '') + ' ' + (customer.surname || '')).trim();
-      customer.phone = customer.mobile || customer.homePhone;
-      customer.address = [customer.address1, customer.address2, customer.town, customer.county, customer.postcode].filter(Boolean).join(', ');
+      // Wait for the freshly-created customer page to have data (it may still be
+      // loading after NoSpos redirects post-create), then scrape it.
+      waitForCustomerScrape(function (customer, resolvedName) {
+        customer.nosposCustomerId = extractNosposCustomerIdFromPath();
+        customer.name = resolvedName;
+        customer.phone = customer.mobile || customer.homePhone;
+        customer.address = [customer.address1, customer.address2, customer.town, customer.county, customer.postcode].filter(Boolean).join(', ');
 
-      profilePictureToDataUrl(customer.profilePicture).then(function (embedded) {
-        customer.profilePicture = embedded || null;
-        chrome.runtime.sendMessage({
-          type: 'NOSPOS_CUSTOMER_DONE',
-          requestId: requestId,
-          cancelled: false,
-          customer: customer,
-          changes: [],
-          newCustomer: true,
-        }).catch(function () {});
-        panel.remove();
+        profilePictureToDataUrl(customer.profilePicture).then(function (embedded) {
+          customer.profilePicture = embedded || null;
+          chrome.runtime.sendMessage({
+            type: 'NOSPOS_CUSTOMER_DONE',
+            requestId: requestId,
+            cancelled: false,
+            customer: customer,
+            changes: [],
+            newCustomer: true,
+          }).catch(function () {});
+          panel.remove();
+        });
       });
     });
 

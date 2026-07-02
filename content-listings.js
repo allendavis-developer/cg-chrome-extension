@@ -53,7 +53,11 @@
     ebay: {
       competitor: 'eBay',
       isListingsPage(url) {
-        return url.includes('ebay.co.uk') && !!document.querySelector('#srp-river-results > ul');
+        if (!url.includes('ebay.co.uk')) return false;
+        // New eBay "su" search-results design (su-item-card grid) OR the legacy
+        // #srp-river-results markup — accept either so both layouts inject.
+        return !!document.querySelector('li.su-grid__item .su-item-card, li .su-item-card[data-listingid]') ||
+          !!document.querySelector('#srp-river-results > ul');
       },
       getSearchTerm() {
         const fromInput = (document.querySelector('#gh-ac')?.value?.trim() || '');
@@ -61,6 +65,13 @@
         return searchTermFromUrlParams(['_nkw', 'nkw', '_query', 'query', 'q']);
       },
       getListContainer() {
+        // New "su" design: a grid <ul> whose direct children are <li class="su-grid__item">.
+        const suCard = document.querySelector('li.su-grid__item .su-item-card, li .su-item-card[data-listingid]');
+        if (suCard) {
+          const li = suCard.closest('li');
+          if (li && li.parentElement) return li.parentElement;
+        }
+        // Legacy design.
         return document.querySelector('#srp-river-results > ul');
       },
       scrapeCards(container) {
@@ -68,26 +79,49 @@
         const results = [];
         const cards = container.querySelectorAll(':scope > li');
         cards.forEach(function (li) {
-          const titleEl = li.querySelector('.s-card__title .su-styled-text.primary.default') ||
+          // eBay's "su" search-results redesign (su-item-card) with a fallback to
+          // the older s-card markup so both layouts scrape during any A/B rollout.
+          const card = li.querySelector('.su-item-card, .s-item-card') || li;
+          const titleEl =
+            li.querySelector('.su-item-card__title .su-styled-text[role="heading"]') ||
+            li.querySelector('.su-item-card__title .su-styled-text, .su-item-card__title span') ||
+            li.querySelector('.s-card__title .su-styled-text.primary.default') ||
             li.querySelector('.s-card__title .su-styled-text, .s-card__title span');
-          const priceEl = li.querySelector('.s-card__price');
-          const linkEl = li.querySelector('a.s-card__link[href*="/itm/"]');
-          const imgEl = li.querySelector('img.s-card__image');
+          const priceEl =
+            li.querySelector('.su-item-card__price') ||
+            li.querySelector('.s-card__price');
+          const linkEl =
+            li.querySelector('a.su-item-card__title[href*="/itm/"]') ||
+            li.querySelector('a.su-media-container__link[href*="/itm/"]') ||
+            li.querySelector('a.s-card__link[href*="/itm/"]') ||
+            li.querySelector('a[href*="/itm/"]');
+          const imgEl =
+            li.querySelector('.su-image img') ||
+            li.querySelector('img.s-card__image') ||
+            li.querySelector('img[src*="ebayimg"]');
           if (!titleEl || !priceEl) return;
           const title = (titleEl.textContent || '').trim();
           if (!title) return;
           const priceRaw = (priceEl.textContent || '').trim();
           const price = priceRaw.replace(/[^0-9.]/g, '').trim() || '0';
           let sold = null;
-          const captionEl = li.querySelector('.s-card__caption');
-          if (captionEl) {
-            const captionText = (captionEl.textContent || '').trim();
-            if (captionText && /sold/i.test(captionText)) sold = captionText;
+          // New design surfaces sold state as a "signal" chip ("Sold 2 Jul 2026").
+          const signalEl = li.querySelector('.signal--recent, .signal');
+          if (signalEl) {
+            const t = (signalEl.textContent || '').trim();
+            if (t && /sold/i.test(t)) sold = t;
+          }
+          if (!sold) {
+            const captionEl = li.querySelector('.s-card__caption');
+            if (captionEl) {
+              const captionText = (captionEl.textContent || '').trim();
+              if (captionText && /sold/i.test(captionText)) sold = captionText;
+            }
           }
           if (!sold) {
             const primaryAttrs = li.querySelector('.su-card-container__attributes__primary');
             if (primaryAttrs) {
-              const rows = primaryAttrs.querySelectorAll('.s-card__attribute-row');
+              const rows = primaryAttrs.querySelectorAll('.s-card__attribute-row, .su-styled-text');
               for (let r = 0; r < rows.length; r++) {
                 const t = (rows[r].textContent || '').trim();
                 if (/^\d+\s*sold$/i.test(t) || t.toLowerCase().includes(' sold')) {
@@ -98,7 +132,9 @@
             }
           }
           // Item ID: prefer data-listingid attribute on the card, fall back to /itm/ URL segment
-          let itemId = li.getAttribute('data-listingid') || null;
+          let itemId =
+            (card.getAttribute && card.getAttribute('data-listingid')) ||
+            li.getAttribute('data-listingid') || null;
           const itemUrl = linkEl ? linkEl.href : window.location.href;
           if (!itemId) {
             const itemIdMatch = itemUrl.match(/\/itm\/(?:[^/?]+\/)?(\d{9,})/);
@@ -106,18 +142,23 @@
           }
 
           // Seller info: visible when "Seller information" is enabled in eBay customise settings.
-          // Secondary attributes block contains seller row (name + feedback) then item-number row.
           let sellerInfo = null;
           const secondaryAttrs = li.querySelector('.su-card-container__attributes__secondary');
           if (secondaryAttrs) {
-            const firstRow = secondaryAttrs.querySelector('.s-card__attribute-row');
-            if (firstRow) {
-              const spans = firstRow.querySelectorAll('span');
-              // Collect all non-empty span texts; join as "name 99% positive (6.1K)"
-              const parts = Array.from(spans)
-                .map(s => (s.textContent || '').trim())
-                .filter(Boolean);
-              if (parts.length) sellerInfo = parts.join(' ');
+            // New design: seller sits in a .su-program-badge ("name 99% positive (6.7K)").
+            const badge = secondaryAttrs.querySelector('.su-program-badge');
+            if (badge) {
+              sellerInfo = (badge.textContent || '').trim() || null;
+            } else {
+              const firstRow = secondaryAttrs.querySelector('.s-card__attribute-row');
+              if (firstRow) {
+                const spans = firstRow.querySelectorAll('span');
+                // Collect all non-empty span texts; join as "name 99% positive (6.1K)"
+                const parts = Array.from(spans)
+                  .map(s => (s.textContent || '').trim())
+                  .filter(Boolean);
+                if (parts.length) sellerInfo = parts.join(' ');
+              }
             }
           }
 

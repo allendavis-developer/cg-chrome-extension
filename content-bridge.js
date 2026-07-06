@@ -52,6 +52,19 @@
   // listener slightly after page load still picks the message up. The
   // app also re-asks on demand via the `getExtensionStatus` bridge action.
   announceHello();
+
+  // Re-injection guard. The background service worker re-injects this bridge
+  // into already-open Cash EPOS tabs on startup / update / enable, because
+  // Chrome does NOT restore content scripts to open tabs when the extension is
+  // (re)enabled or auto-updated — the page would otherwise be left with no
+  // bridge and show "out of sync" until a manual refresh. We ALWAYS re-announce
+  // (above) so the page re-detects us, but must register the message listeners
+  // only once per document, or every bridged action would run its handler twice.
+  // The flag lives on the shared content-script window, so a second injection
+  // into the same isolated world sees it and bails after re-announcing.
+  if (window.__cgSuiteContentBridgeLoaded) return;
+  window.__cgSuiteContentBridgeLoaded = true;
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', announceHello, { once: true });
   }

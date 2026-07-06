@@ -26,6 +26,107 @@
   /** Load Inter to match the CG Suite web app (panel UI only; monospace unchanged). */
   CG_DOM_UTILS.ensureCgSuiteInter();
 
+  // ——————————————————————————————————————————————————————————————————————
+  // Search-term history (Reports → Search Terms).
+  //
+  // The app already receives the final on-site search box term as `searchTerm`
+  // when the operator confirms. But within a single tab session an operator may
+  // run several searches / refinements before confirming — on eBay/CC/CG each is
+  // a full page reload, on CeX (SPA) it's a URL change. We accumulate every
+  // *executed* search term (read from the URL query the site puts it in — _nkw /
+  // query / q / stext) in per-tab sessionStorage so it survives those reloads,
+  // then hand the whole ordered sequence back with the scrape as
+  // `searchTermHistory`. The app logs each so an owner can see the full
+  // refinement journey, not just the final term.
+  // ——————————————————————————————————————————————————————————————————————
+  var SEARCH_HISTORY_KEY = 'cgSuiteSearchHistory';
+  /** URL query params each site puts the executed search term in. */
+  var SEARCH_TERM_URL_PARAMS = ['_nkw', 'nkw', '_query', 'query', 'q', 'stext', 'search', 'keywords'];
+
+  function getSearchHistory() {
+    try {
+      if (!window.sessionStorage) return [];
+      var raw = window.sessionStorage.getItem(SEARCH_HISTORY_KEY);
+      var arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function clearSearchHistory() {
+    try {
+      if (window.sessionStorage) window.sessionStorage.removeItem(SEARCH_HISTORY_KEY);
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  /** Append a term to the per-tab history if it's new (differs from the last one). */
+  function recordSearchTerm(term) {
+    var t = (term == null ? '' : String(term)).trim();
+    if (!t) return;
+    try {
+      var hist = getSearchHistory();
+      var last = hist.length ? String(hist[hist.length - 1] || '').trim().toLowerCase() : '';
+      if (t.toLowerCase() === last) return;
+      hist.push(t);
+      // Bound it so a runaway SPA can't grow sessionStorage unbounded.
+      if (hist.length > 40) hist = hist.slice(hist.length - 40);
+      if (window.sessionStorage) window.sessionStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(hist));
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  /** The search term the site is currently *showing results for* — read from the
+   *  URL query (stable across all four sites), falling back to the site's own
+   *  search box via the config's getSearchTerm when there is no query param. */
+  function currentExecutedSearchTerm() {
+    var fromUrl = searchTermFromUrlParams(SEARCH_TERM_URL_PARAMS);
+    if (fromUrl) return fromUrl;
+    // No query param (e.g. CeX product-detail page). Only trust the input box for
+    // non-CeX sites — on CeX getSearchTerm() returns the product title, not a search.
+    var config = getSiteConfig();
+    if (config && config !== SITE_CONFIGS.cex) {
+      try {
+        return config.getSearchTerm() || '';
+      } catch (e) {
+        return '';
+      }
+    }
+    return '';
+  }
+
+  /** Record whatever search the site is currently showing. Safe to call often. */
+  function maybeRecordSearch() {
+    recordSearchTerm(currentExecutedSearchTerm());
+  }
+
+  // On-site search inputs across the four sites. CeX's predictive search box
+  // (id="predictiveSearchText", name="search") is an SPA field that may not
+  // always change the URL, so we also record the typed value the moment the
+  // operator executes the search (Enter). Covers eBay #gh-ac, CC/CG query
+  // inputs and any generic search box too.
+  var SEARCH_INPUT_SELECTOR =
+    '#predictiveSearchText, #gh-ac, input[name="search"], input[name="query"], input[name="q"], input[type="search"]';
+
+  /** Delegated Enter listener: capture the executed search term at submit time,
+   *  even before any navigation. Best-effort; never throws into the page. */
+  function recordSearchInputOnEnter(e) {
+    try {
+      if (e.key !== 'Enter') return;
+      var el = e.target;
+      if (!el || el.tagName !== 'INPUT') return;
+      if (!el.matches || !el.matches(SEARCH_INPUT_SELECTOR)) return;
+      var v = (el.value || '').trim();
+      if (v) recordSearchTerm(v);
+    } catch (err) {
+      /* ignore */
+    }
+  }
+  document.addEventListener('keydown', recordSearchInputOnEnter, true);
+
   /**
    * eBay SRP: "6 results for rode m1" in h1.srp-controls__count-heading — strict keyword matches.
    * Listings after that index are broader / fewer-keywords matches.
@@ -842,11 +943,18 @@
     const searchTerm = config ? config.getSearchTerm() : '';
     const container = config ? config.getListContainer() : null;
     let results = config ? config.scrapeCards(container) : [];
+    // Capture the term currently on screen, then hand back the whole per-tab
+    // search history (each executed search / refinement, in order) for the audit
+    // log — and clear it so the next round starts fresh.
+    maybeRecordSearch();
+    const searchTermHistory = getSearchHistory();
+    clearSearchHistory();
     const out = {
       success: true,
       results: results,
       competitor: competitor,
       searchTerm: searchTerm,
+      searchTermHistory: searchTermHistory,
       listingPageUrl: window.location.href
     };
     if (config === SITE_CONFIGS.ebay) {
@@ -874,16 +982,20 @@
     document.addEventListener('DOMContentLoaded', function () {
       if (typeof console !== 'undefined') console.log('[CG Suite content-listings] DOMContentLoaded, maybeNotifyReady');
       setCexRequestIdFromUrl();
+      maybeRecordSearch();
       maybeNotifyReady();
     });
   } else {
     setCexRequestIdFromUrl();
+    maybeRecordSearch();
     maybeNotifyReady();
   }
 
   // —— CeX SPA: URL can change without full reload. Listen for history changes so we notify as soon as we're on product-detail. ——
   var lastNotifiedUrl = '';
   function onUrlMaybeChanged() {
+    // Record on every URL change for all sites (each executed search / refine).
+    maybeRecordSearch();
     var url = window.location.href || '';
     if (url === lastNotifiedUrl) return;
     if (getSiteConfig() !== SITE_CONFIGS.cex) return;
@@ -913,6 +1025,9 @@
 
   // Poll: on CeX, keep notifying when we're on a listing page (in case history listeners missed it). Remove panel when user navigates away.
   setInterval(function () {
+    // Record the on-screen search for all sites (SPA URL changes the history
+    // listeners might have missed); keep the CeX notify/poll behaviour as-is.
+    maybeRecordSearch();
     if (getSiteConfig() === SITE_CONFIGS.cex) {
       if (isListingsPage()) lastNotifiedUrl = window.location.href || '';
       maybeNotifyReady();

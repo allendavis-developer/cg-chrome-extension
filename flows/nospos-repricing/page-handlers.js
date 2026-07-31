@@ -629,8 +629,8 @@ async function handleNosposStockEditReady(message, sender) {
   }
 
   d = appendRepricingLog(d, currentExternallyListed
-    ? 'Externally Listed: already ticked'
-    : 'Externally Listed: ticking');
+    ? 'Externally Listed: ticked (left unchanged)'
+    : 'Externally Listed: not ticked (left unchanged)');
 
   if (salePrice !== '') {
     d = appendRepricingLog(d, oldPrice
@@ -650,7 +650,10 @@ async function handleNosposStockEditReady(message, sender) {
     currentItemTitle: item?.title || ''
   });
 
-  return { ok: true, salePrice, stockName: newStockName, externallyListed: true, done: false };
+  // Repricing changes price and name only. Marking stock as externally listed
+  // belongs to the Web EPOS upload flow, which drives it separately via the
+  // setNosposExternallyListedOn bridge action.
+  return { ok: true, salePrice, stockName: newStockName, externallyListed: false, done: false };
 }
 
 function normalizePriceForCompare(val) {

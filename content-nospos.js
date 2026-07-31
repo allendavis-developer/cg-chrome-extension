@@ -1242,11 +1242,15 @@
           nameEl.dispatchEvent(new Event('change', { bubbles: true }));
         }
       }
-      // Tick externally listed for every item
-      var extEl = document.querySelector('#stock-externally_listed_at[type="checkbox"]');
-      if (extEl && !extEl.checked) {
-        extEl.checked = true;
-        extEl.dispatchEvent(new Event('change', { bubbles: true }));
+      // Only tick "Manually Listed" when the flow explicitly asks for it.
+      // Repricing must leave the flag exactly as the operator set it — it is
+      // the Web EPOS uploader's job to mark an item as externally listed.
+      if (response.externallyListed === true) {
+        var extEl = document.querySelector('#stock-externally_listed_at[type="checkbox"]');
+        if (extEl && !extEl.checked) {
+          extEl.checked = true;
+          extEl.dispatchEvent(new Event('change', { bubbles: true }));
+        }
       }
       if (response.salePrice !== undefined) fillRetailPriceInput(response.salePrice);
       setTimeout(function () { clickSaveButton(); }, 150);

@@ -230,25 +230,56 @@ function normalizeNosposStockEditUrl(raw) {
  */
 function parseNosposStockEditPageChangeLog(html) {
   var out = [];
-  var titleIdx = html.search(/<h4[^>]*class="[^"]*card-title[^"]*"[^>]*>\s*Changes\s*<\/h4>/i);
-  if (titleIdx === -1) {
-    titleIdx = html.search(/class="[^"]*card-title[^"]*"[^>]*>\s*Changes\s*<\/h4>/i);
+  if (!html) return out;
+
+  // PJAX responses can contain the Changes grid without its surrounding card
+  // title. Find the table by its stable column headings first; this also avoids
+  // accidentally taking another table that happens to follow a "Changes" label.
+  var tableHtml = '';
+  var tableRe = /<table\b[^>]*>[\s\S]*?<\/table>/gi;
+  var tableMatch;
+  while ((tableMatch = tableRe.exec(html)) !== null) {
+    var candidate = tableMatch[0];
+    var theadMatch = candidate.match(/<thead[^>]*>([\s\S]*?)<\/thead>/i);
+    if (!theadMatch) continue;
+    var headingText = decodeNosposHtmlText(theadMatch[1].replace(/<[^>]*>/g, ' ')).toLowerCase();
+    if (
+      headingText.indexOf('old value') !== -1 &&
+      headingText.indexOf('new value') !== -1 &&
+      headingText.indexOf('changed by') !== -1
+    ) {
+      tableHtml = candidate;
+      break;
+    }
   }
-  if (titleIdx === -1) {
-    titleIdx = html.search(/>\s*Changes\s*<\//i);
+
+  // Older full-page responses are still supported if their header wording
+  // changes: retain the original title-adjacent-table fallback.
+  if (!tableHtml) {
+    var titleIdx = html.search(/<h4[^>]*class="[^"]*card-title[^"]*"[^>]*>\s*Changes\s*<\/h4>/i);
+    if (titleIdx === -1) {
+      titleIdx = html.search(/class="[^"]*card-title[^"]*"[^>]*>\s*Changes\s*<\/h4>/i);
+    }
+    if (titleIdx === -1) {
+      titleIdx = html.search(/>\s*Changes\s*<\//i);
+    }
+    if (titleIdx === -1) return out;
+    var slice = html.slice(titleIdx, titleIdx + 250000);
+    var tableIdx = slice.indexOf('<table');
+    if (tableIdx === -1) return out;
+    var fallbackTableMatch = slice.slice(tableIdx).match(/<table\b[^>]*>[\s\S]*?<\/table>/i);
+    if (!fallbackTableMatch) return out;
+    tableHtml = fallbackTableMatch[0];
   }
-  if (titleIdx === -1) return out;
-  var slice = html.slice(titleIdx, titleIdx + 250000);
-  var tableIdx = slice.indexOf('<table');
-  if (tableIdx === -1) return out;
-  var fromTable = slice.slice(tableIdx);
-  var tbodyMatch = fromTable.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i);
+
+  var tbodyMatch = tableHtml.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i);
   if (!tbodyMatch) return out;
   var tbody = tbodyMatch[1];
-  var trRe = /<tr[^>]*data-key="(\d+)"[^>]*>([\s\S]*?)<\/tr>/gi;
+  var trRe = /<tr\b[^>]*\bdata-key=(?:"(\d+)"|'(\d+)')[^>]*>([\s\S]*?)<\/tr>/gi;
   var m;
   while ((m = trRe.exec(tbody)) !== null) {
-    var rowHtml = m[2];
+    var rowKey = m[1] || m[2];
+    var rowHtml = m[3];
     var tdRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
     var cells = [];
     var tm;
@@ -259,7 +290,7 @@ function parseNosposStockEditPageChangeLog(html) {
     out.push({
       changeEntryId: String(cells[0] || '')
         .replace(/^#\s*/, '')
-        .trim() || String(m[1]),
+        .trim() || String(rowKey),
       columnName: cells[1] || '',
       oldValue: cells[2] || '',
       newValue: cells[3] || '',

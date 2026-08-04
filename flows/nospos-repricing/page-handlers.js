@@ -628,9 +628,29 @@ async function handleNosposStockEditReady(message, sender) {
     d = appendRepricingLog(d, nameMsg);
   }
 
-  d = appendRepricingLog(d, currentExternallyListed
-    ? 'Externally Listed: ticked (left unchanged)'
-    : 'Externally Listed: not ticked (left unchanged)');
+  // Whether this NosPos pass should mark stock as "Manually Listed".
+  //
+  // The upload flow and the repricing flow share this handler, and they want
+  // opposite things: an upload is putting the item live on Web EPOS, so NosPos
+  // must say so; a reprice only changes price and name, and the flag is the
+  // operator's — a repriced item that was already ticked must stay ticked, and
+  // one that wasn't must stay unticked. So repricing doesn't read it, doesn't
+  // log it, and doesn't send anything about it: as far as a reprice is
+  // concerned the checkbox doesn't exist.
+  //
+  // The caller decides via `markExternallyListed` on the job state (see
+  // open-nospos-and-wait.js). Defaults to false, so an older website that
+  // doesn't send the flag gets the leave-it-alone behaviour.
+  const markExternallyListed = data.markExternallyListed === true;
+
+  if (markExternallyListed) {
+    d = appendRepricingLog(
+      d,
+      currentExternallyListed
+        ? 'Externally Listed: already ticked'
+        : 'Externally Listed: ticking (upload)'
+    );
+  }
 
   if (salePrice !== '') {
     d = appendRepricingLog(d, oldPrice
@@ -650,10 +670,7 @@ async function handleNosposStockEditReady(message, sender) {
     currentItemTitle: item?.title || ''
   });
 
-  // Repricing changes price and name only. Marking stock as externally listed
-  // belongs to the Web EPOS upload flow, which drives it separately via the
-  // setNosposExternallyListedOn bridge action.
-  return { ok: true, salePrice, stockName: newStockName, externallyListed: false, done: false };
+  return { ok: true, salePrice, stockName: newStockName, externallyListed: markExternallyListed, done: false };
 }
 
 function normalizePriceForCompare(val) {

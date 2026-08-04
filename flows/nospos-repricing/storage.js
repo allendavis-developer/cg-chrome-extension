@@ -207,6 +207,9 @@ function buildRepricingStatusPayload(data, overrides = {}) {
 
   return {
     cartKey: data?.cartKey || '',
+    // Per-run identity so the page can tell this run's progress from a stale
+    // run's. See buildRepricingCompletionPayload for why cartKey isn't enough.
+    runId: data?.runId || '',
     running: overrides.running != null ? !!overrides.running : !data?.done,
     done: overrides.done != null ? !!overrides.done : !!data?.done,
     step: overrides.step || data?.step || (data?.done ? 'completed' : 'working'),

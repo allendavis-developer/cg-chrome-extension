@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CG Suite Research",
-  "version": "1.8.6",
+  "version": "1.9.0",
   "description": "Capture listing data from eBay, Cash Converters, and Cash Generator for CG Suite research forms.",
   "permissions": [
     "activeTab",

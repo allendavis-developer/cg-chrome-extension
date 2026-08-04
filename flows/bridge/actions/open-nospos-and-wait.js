@@ -39,8 +39,18 @@ async function handleBridgeAction_openNosposAndWait({ requestId, appTabId, paylo
   const completedBarcodes = payload.completedBarcodes || {};
   const completedItems = payload.completedItems || [];
   const cartKey = payload.cartKey || '';
+  // Upload drives this same NosPos pass and needs each item marked "Manually
+  // Listed" (it's going live on Web EPOS); repricing must leave that flag
+  // alone. Carried on the job state so every stock-edit page in the queue sees
+  // it — read in page-handlers.js::handleNosposStockEditReady. Absent (older
+  // website) → false, i.e. the repricing behaviour.
+  const markExternallyListed = payload.markExternallyListed === true;
+  // Opaque id the page mints per run. Echoed back on every progress and
+  // completion payload so the page can ignore anything belonging to a run other
+  // than the one it started.
+  const runId = String(payload.runId || '');
 
-  const data = { repricingData, appTabId, completedBarcodes, completedItems, cartKey, nosposTabId };
+  const data = { repricingData, appTabId, completedBarcodes, completedItems, cartKey, nosposTabId, markExternallyListed, runId };
   const pending = await getPending();
   pending[requestId] = { appTabId, listingTabId: nosposTabId, type: 'openNospos', repricingData };
   await setPending(pending);

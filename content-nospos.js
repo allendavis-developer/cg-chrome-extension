@@ -1242,18 +1242,39 @@
           nameEl.dispatchEvent(new Event('change', { bubbles: true }));
         }
       }
-      // Only tick "Manually Listed" when the flow explicitly asks for it.
-      // Repricing must leave the flag exactly as the operator set it — it is
-      // the Web EPOS uploader's job to mark an item as externally listed.
-      if (response.externallyListed === true) {
+      // "Manually Listed" is ONE-WAY here: upload turns it on, nothing in this
+      // flow ever turns it off.
+      //
+      //   * Only runs when the flow explicitly asks (`externallyListed === true`)
+      //     — repricing sends false, so the checkbox is never even looked at and
+      //     an item the operator already ticked stays ticked.
+      //   * Sets `.checked = true` rather than calling `.click()`. A click is a
+      //     toggle: on an already-ticked item it would untick it. Assignment is
+      //     idempotent, and the `!extEl.checked` guard means an already-ticked
+      //     item is left completely alone.
+      var wantExternallyListed = response.externallyListed === true;
+      if (wantExternallyListed) {
         var extEl = document.querySelector('#stock-externally_listed_at[type="checkbox"]');
         if (extEl && !extEl.checked) {
           extEl.checked = true;
+          extEl.dispatchEvent(new Event('input', { bubbles: true }));
           extEl.dispatchEvent(new Event('change', { bubbles: true }));
         }
       }
       if (response.salePrice !== undefined) fillRetailPriceInput(response.salePrice);
-      setTimeout(function () { clickSaveButton(); }, 150);
+      setTimeout(function () {
+        // Re-assert immediately before saving: the 150ms gap gives the page a
+        // chance to re-render the form and drop our change. Still an assignment,
+        // still guarded, so it can only ever end up ticked — never toggled off.
+        if (wantExternallyListed) {
+          var el = document.querySelector('#stock-externally_listed_at[type="checkbox"]');
+          if (el && !el.checked) {
+            el.checked = true;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+        clickSaveButton();
+      }, 150);
     });
   }
 

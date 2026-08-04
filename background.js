@@ -73,6 +73,8 @@ importScripts(
   'flows/bridge/actions/get-nospos-tab-url.js',
   'flows/bridge/actions/get-park-agreement-log.js',
   'flows/bridge/actions/get-upload-log.js',
+  'flows/bridge/actions/append-upload-log.js',
+  'flows/bridge/actions/check-nospos-login-and-shop.js',
   'flows/bridge/actions/navigate-web-epos-product-in-worker.js',
   'flows/bridge/actions/open-jewellery-scrap-prices.js',
   'flows/bridge/actions/open-nospos-and-wait.js',

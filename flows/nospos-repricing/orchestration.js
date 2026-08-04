@@ -30,7 +30,11 @@ function applyVerifiedBarcodeCompletion(data) {
   const barcodeIndex = pendingCompletion.barcodeIndex;
 
   if (!completedBarcodes[itemId]) completedBarcodes[itemId] = [];
-  if (!completedBarcodes[itemId].includes(barcodeIndex)) {
+  // A completion can be applied more than once for the same barcode — the
+  // verify step retries, and a 429 recovery reloads the stock-edit page, which
+  // re-fires NOSPOS_STOCK_EDIT_READY. That's why this guard exists.
+  const alreadyRecorded = completedBarcodes[itemId].includes(barcodeIndex);
+  if (!alreadyRecorded) {
     completedBarcodes[itemId] = [...completedBarcodes[itemId], barcodeIndex];
   }
 
@@ -41,7 +45,11 @@ function applyVerifiedBarcodeCompletion(data) {
   }
 
   const verifiedChanges = [...(data.verifiedChanges || [])];
-  if (item) {
+  // Same guard as `completedBarcodes` above. Without it a re-applied completion
+  // pushed a second identical row here, and since `items_data: verifiedChanges`
+  // and `barcode_count: verifiedChanges.length` feed the session report
+  // directly, the operator saw a barcode they entered once listed twice.
+  if (item && !alreadyRecorded) {
     verifiedChanges.push({
       item_identifier: item.itemId != null ? String(item.itemId) : '',
       title: item.title || '',
@@ -105,6 +113,11 @@ function buildRepricingCompletionPayload(data) {
 
   return {
     cart_key: data?.cartKey || '',
+    // Which run produced this. `cart_key` alone can't identify a run: repricing
+    // the same items twice yields the same key, so a result left over from an
+    // earlier run was indistinguishable from the live one and got applied to
+    // it — closing the progress overlay mid-run and announcing "done and saved".
+    run_id: data?.runId || '',
     item_count: [...new Set(verifiedChanges.map((item) => item.item_identifier).filter(Boolean))].length,
     barcode_count: verifiedChanges.length,
     items_data: verifiedChanges,

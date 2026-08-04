@@ -41,15 +41,23 @@ async function handleBridgeAction_scrapeNosposListedStockPage({ requestId, appTa
     }
 
     const r = await nosposCredentialedHtmlFetch(url);
-    if (r.loginRequired) return { ok: false, loginRequired: true };
-    if (!r.ok) return { ok: false, error: r.error, pages: page - 1 };
+    if (r.loginRequired) {
+      logUpload('scrapeNosposListedStockPage', 'login-required', { page, url }, 'NosPos redirected to login');
+      return { ok: false, loginRequired: true };
+    }
+    if (!r.ok) {
+      logUpload('scrapeNosposListedStockPage', 'fetch-failed', { page, url, error: r.error }, r.error || 'fetch failed');
+      return { ok: false, error: r.error, pages: page - 1 };
+    }
 
     const rows = parseNosposSearchResults(r.html);
     const nextUrl = parseNosposPaginationNextHref(r.html, r.finalUrl);
 
+    logUpload('scrapeNosposListedStockPage', 'page', { page, rowCount: rows.length, hasMore: !!nextUrl }, 'listed-stock page read');
     emitProgress({ page, rows, hasMore: !!nextUrl });
     url = nextUrl;
   }
 
+  logUpload('scrapeNosposListedStockPage', 'done', { pages: page }, 'listed-stock walk finished');
   return { ok: true, pages: page };
 }

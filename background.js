@@ -95,6 +95,7 @@ importScripts(
   'flows/bridge/actions/scrape-cex-super-categories.js',
   'flows/bridge/actions/scrape-nospos-stock-edit-for-upload.js',
   'flows/bridge/actions/scrape-nospos-listed-stock-page.js',
+  'flows/bridge/actions/scrape-nospos-payment-report.js',
   'flows/bridge/actions/navigate-nospos-stock-edit-in-worker.js',
   'flows/bridge/actions/set-nospos-externally-listed-off.js',
   'flows/bridge/actions/set-nospos-externally-listed-on.js',

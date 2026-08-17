@@ -21,6 +21,7 @@ const BRIDGE_ACTIONS = {
   searchNosposBarcode: handleBridgeAction_searchNosposBarcode,
   scrapeNosposStockEditForUpload: handleBridgeAction_scrapeNosposStockEditForUpload,
   scrapeNosposListedStockPage: handleBridgeAction_scrapeNosposListedStockPage,
+  scrapeNosposPaymentReport: handleBridgeAction_scrapeNosposPaymentReport,
   navigateNosposStockEditInWorker: handleBridgeAction_navigateNosposStockEditInWorker,
   setNosposExternallyListedOff: handleBridgeAction_setNosposExternallyListedOff,
   setNosposExternallyListedOn: handleBridgeAction_setNosposExternallyListedOn,

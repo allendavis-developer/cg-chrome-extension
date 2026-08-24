@@ -23,9 +23,34 @@
  */
 
 const NOSPOS_PAYMENT_REPORT_URL = 'https://nospos.com/reports/management/payment';
-const NOSPOS_PAYMENT_REPORT_START_URL =
-  `${NOSPOS_PAYMENT_REPORT_URL}?page=1&per-page=100`;
 const NOSPOS_PAYMENT_REPORT_MAX_PAGES = 200;
+
+/**
+ * The report URL for one page, with the date filter applied.
+ *
+ * Built from our own parameters every time rather than followed from the page's
+ * "next" link. NosPos's pagination links carry only `page=` — drop back to them
+ * and both `per-page=100` AND the date filter fall off on page 2, which would
+ * quietly scrape the entire report while looking like it respected the dates.
+ * The page's next link is still read, but only to answer "is there another
+ * page", never to decide which URL that page is.
+ *
+ * The empty type/method/till/createdBy parameters mirror what the NosPos filter
+ * form itself submits.
+ */
+function nosposPaymentReportUrl(page, fromDate, toDate) {
+  const params = new URLSearchParams();
+  params.set('page', String(page));
+  params.set('per-page', '100');
+  params.set('PaymentSearch[fromDate]', fromDate || '');
+  params.set('PaymentSearch[toDate]', toDate || '');
+  params.set('PaymentSearch[type]', '');
+  params.set('PaymentSearch[method]', '');
+  params.set('PaymentSearch[till]', '');
+  params.set('PaymentSearch[tillStatus]', '');
+  params.set('PaymentSearch[createdBy]', '');
+  return `${NOSPOS_PAYMENT_REPORT_URL}?${params.toString()}`;
+}
 
 /** Tag soup → plain text: strip tags, decode the entities NosPos actually emits. */
 function nosposPaymentCellText(html) {
@@ -38,6 +63,9 @@ function nosposPaymentCellText(html) {
     .replace(/&quot;/gi, '"')
     .replace(/&#0?39;|&apos;/gi, "'")
     .replace(/&pound;/gi, '£')
+    .replace(/&mdash;/gi, '\u2014')
+    .replace(/&ndash;/gi, '\u2013')
+    .replace(/&hellip;/gi, '\u2026')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -54,9 +82,42 @@ function nosposPaymentRelatedHref(rowHtml) {
     const href = match[1].replace(/&amp;/g, '&').trim();
     if (!href || href === '#') continue;
     if (/\/management\/till\/modify/i.test(href)) continue; // that's the Till cell
+    // A manual payment has no record behind it, so the only href left in its
+    // action cell is the receipt. Returning that would make the crawl treat a
+    // PDF as the transaction the money belongs to.
+    if (/\/protected-file\/view/i.test(href)) continue;
     return href.startsWith('http') ? href : `https://nospos.com${href}`;
   }
   return '';
+}
+
+/**
+ * The till a payment happened at, as an id rather than a name.
+ *
+ * The Till cell is a LINK — `<a href="/management/till/modify?id=4">BUYING01</a>`
+ * — and only the text was being kept. Names are per branch and get edited; the
+ * id is the stable handle, and without it every payment would have to be
+ * matched back to a drawer by string comparison.
+ */
+function nosposPaymentTillId(cellHtml) {
+  const match = String(cellHtml || '').match(/\/management\/till\/modify\?id=(\d+)/i);
+  return match ? match[1] : '';
+}
+
+/**
+ * The receipt attached to a manual payment, if one has been uploaded.
+ *
+ * NosPos shows a live file icon linking `/protected-file/view?id=N` where a
+ * receipt exists and a disabled one where it does not, which is exactly the
+ * distinction that matters: petty cash without a receipt is an unexplained hole
+ * in a drawer. Kept as its own field rather than left to be mistaken for the
+ * row's related record — `nosposPaymentRelatedHref` would otherwise return this
+ * file link for a Petty row, since such rows have no agreement or cart to point
+ * at and the file is the only href left standing.
+ */
+function nosposPaymentReceiptFileId(rowHtml) {
+  const match = String(rowHtml || '').match(/\/protected-file\/view\?id=(\d+)/i);
+  return match ? match[1] : '';
 }
 
 /**
@@ -90,16 +151,19 @@ function parseNosposPaymentReportRows(html) {
       method: nosposPaymentCellText(cells[3]),
       amount: nosposPaymentCellText(cells[4]),
       till: nosposPaymentCellText(cells[5]),
+      // Additive fields — an older Cash EPOS build simply ignores them.
+      nospos_till_id: nosposPaymentTillId(cells[5]),
       created: nosposPaymentCellText(cells[6]),
       created_by: nosposPaymentCellText(cells[7]),
       related_href: nosposPaymentRelatedHref(cells[8] || ''),
+      receipt_file_id: nosposPaymentReceiptFileId(cells[8] || ''),
     });
   }
   return rows;
 }
 
 /** Inactive tab in the app's window, focus handed back — never a focus steal. */
-async function openNosposPaymentReportTab(appTabId) {
+async function openNosposPaymentReportTab(appTabId, url) {
   let windowId = null;
   if (appTabId) {
     try {
@@ -113,7 +177,7 @@ async function openNosposPaymentReportTab(appTabId) {
       windowId = w?.id ?? null;
     } catch (_) {}
   }
-  const createOpts = { url: NOSPOS_PAYMENT_REPORT_START_URL, active: false };
+  const createOpts = { url, active: false };
   if (windowId != null) createOpts.windowId = windowId;
   const tab = await chrome.tabs.create(createOpts);
   if (typeof disableTabAutoDiscard === 'function') await disableTabAutoDiscard(tab.id);
@@ -130,13 +194,17 @@ async function handleBridgeAction_scrapeNosposPaymentReport({ requestId, appTabI
       .catch(() => { /* app tab may be gone; not fatal */ });
   };
 
+  const fromDate = String(payload?.fromDate || '').trim();
+  const toDate = String(payload?.toDate || '').trim();
+
   let tabId = null;
   // The tab is a convenience, not the data path: if it can't be opened (popup
   // limits, a closing window) the scrape still runs rather than failing the
-  // whole migration over a tab nobody has looked at yet.
+  // whole migration over a tab nobody has looked at yet. It shows the same
+  // filtered view the scrape reads, so the two can be compared by eye.
   if (payload?.openTab !== false) {
     try {
-      tabId = await openNosposPaymentReportTab(appTabId);
+      tabId = await openNosposPaymentReportTab(appTabId, nosposPaymentReportUrl(1, fromDate, toDate));
     } catch (err) {
       console.warn('[CG Suite] payment report: could not open background tab', err);
     }
@@ -144,11 +212,12 @@ async function handleBridgeAction_scrapeNosposPaymentReport({ requestId, appTabI
 
   const rows = [];
   const seen = new Set();
-  let url = NOSPOS_PAYMENT_REPORT_START_URL;
+  let hasMore = true;
   let page = 0;
 
-  while (url) {
+  while (hasMore) {
     page += 1;
+    const url = nosposPaymentReportUrl(page, fromDate, toDate);
     if (page > NOSPOS_PAYMENT_REPORT_MAX_PAGES) {
       return {
         ok: false,
@@ -170,11 +239,13 @@ async function handleBridgeAction_scrapeNosposPaymentReport({ requestId, appTabI
     fresh.forEach((row) => seen.add(row.key));
     rows.push(...fresh);
 
-    const nextUrl = parseNosposPaginationNextHref(r.html, r.finalUrl);
-    emitProgress({ page, rows: fresh, total: rows.length, hasMore: !!nextUrl });
-    url = nextUrl;
+    // Only used as a yes/no — the URL itself is ours (see nosposPaymentReportUrl).
+    // A page that came back with no rows also ends the walk, so a filter that
+    // matches nothing can't spin on a stale "next" link.
+    hasMore = Boolean(parseNosposPaginationNextHref(r.html, r.finalUrl)) && pageRows.length > 0;
+    emitProgress({ page, rows: fresh, total: rows.length, hasMore });
   }
 
-  console.log('[CG Suite] payment report scraped', { pages: page, rows: rows.length });
-  return { ok: true, rows, pages: page, tabId };
+  console.log('[CG Suite] payment report scraped', { pages: page, rows: rows.length, fromDate, toDate });
+  return { ok: true, rows, pages: page, tabId, fromDate, toDate };
 }

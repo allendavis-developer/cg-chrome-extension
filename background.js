@@ -28,6 +28,8 @@ importScripts(
   'bg/tab-utils.js',
   'bg/nospos-url-utils.js',
   'bg/nospos-html.js',
+  // After nospos-html.js: it assigns that file's NOSPOS_FETCH_OBSERVER hook.
+  'bg/nospos-pool.js',
   'sdk/park-ui.js',
   'sdk/nospos-tab-open.js',
   'sdk/nospos-recovery.js',
@@ -96,6 +98,9 @@ importScripts(
   'flows/bridge/actions/scrape-nospos-stock-edit-for-upload.js',
   'flows/bridge/actions/scrape-nospos-listed-stock-page.js',
   'flows/bridge/actions/scrape-nospos-payment-report.js',
+  'flows/bridge/actions/scrape-nospos-agreements.js',
+  'flows/bridge/actions/scrape-nospos-carts.js',
+  'flows/bridge/actions/scrape-nospos-trading-report.js',
   'flows/bridge/actions/navigate-nospos-stock-edit-in-worker.js',
   'flows/bridge/actions/set-nospos-externally-listed-off.js',
   'flows/bridge/actions/set-nospos-externally-listed-on.js',

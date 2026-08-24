@@ -32,6 +32,22 @@ var NOSPOS_HTML_FETCH_HEADERS = {
  */
 var NOSPOS_HTML_FETCH_RETRY_DELAYS_MS = [400, 900, 1600];
 
+/**
+ * Optional observer for fetch outcomes, set by bg/nospos-pool.js.
+ *
+ * The retry loop below absorbs a 429 and returns success, which is right for
+ * the caller but hides the one signal a scheduler needs: that NosPos is asking
+ * us to slow down. Rather than teach this primitive about concurrency, it just
+ * announces what happened and whoever is scheduling can react. Null by default,
+ * so nothing changes for callers that never load the pool.
+ */
+var NOSPOS_FETCH_OBSERVER = null;
+
+function nosposFetchObserve(kind, status) {
+  if (typeof NOSPOS_FETCH_OBSERVER !== 'function') return;
+  try { NOSPOS_FETCH_OBSERVER({ kind: kind, status: status }); } catch (_) {}
+}
+
 function nosposHtmlFetchParseRetryAfter(headerValue) {
   if (!headerValue) return null;
   var raw = String(headerValue).trim();
@@ -77,6 +93,7 @@ async function nosposCredentialedHtmlFetch(url) {
 
     if (response.status === 429 || response.status >= 500) {
       lastError = 'NosPos returned ' + response.status;
+      nosposFetchObserve('throttled', response.status);
       if (attempt < NOSPOS_HTML_FETCH_RETRY_DELAYS_MS.length) {
         var hinted = nosposHtmlFetchParseRetryAfter(response.headers?.get?.('Retry-After'));
         var baseDelay = NOSPOS_HTML_FETCH_RETRY_DELAYS_MS[attempt];
@@ -93,6 +110,7 @@ async function nosposCredentialedHtmlFetch(url) {
 
     try {
       var html = await response.text();
+      nosposFetchObserve('ok', response.status);
       return { ok: true, html: html, finalUrl: finalUrl };
     } catch (e) {
       return { ok: false, error: e?.message || 'Read failed' };
@@ -130,6 +148,10 @@ function decodeNosposHtmlText(value) {
     .replace(/&#39;/g, "'")
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
+    .replace(/&mdash;/gi, '\u2014')
+    .replace(/&ndash;/gi, '\u2013')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&pound;/gi, '\u00a3')
     .replace(/\s+/g, ' ')
     .trim();
 }

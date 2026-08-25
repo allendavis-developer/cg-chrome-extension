@@ -14,6 +14,18 @@
   const CG_SUITE_CONTENT_BRIDGE_DEBUG = true;
   console.log('[CG Suite content-bridge] module loaded', { url: location.href });
 
+  /**
+   * A fresh id for this injection of the bridge — one per page load.
+   *
+   * A tab id cannot tell one page load from the next, and a reload puts a new
+   * page in the same tab. NosPos walks need the difference: an unload message
+   * wakes the service worker and can be processed after the replacement page
+   * has already started a capture, and without this stamp that stale message
+   * stopped its own successor's walk before it fetched anything. See
+   * bg/nospos-abort.js.
+   */
+  const CG_PAGE_INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
   const JEWELLERY_SCRAP_TO_PAGE = 'JEWELLERY_SCRAP_PRICES_TO_CONTENT';
   const JEWELLERY_SCRAP_WINDOW = 'JEWELLERY_SCRAP_PRICES';
 
@@ -119,7 +131,13 @@
     'pagehide',
     function (ev) {
       if (ev.persisted) return;
-      chrome.runtime.sendMessage({ type: 'CG_APP_PAGE_UNLOADING' }).catch(function () {});
+      // Stamped with the instance that is going. A reload puts a NEW page in
+      // the SAME tab, and this message wakes the service worker — so it can
+      // arrive after the replacement has already started work. Naming the page
+      // it belongs to is what stops it killing its own successor's capture.
+      chrome.runtime
+        .sendMessage({ type: 'CG_APP_PAGE_UNLOADING', pageInstanceId: CG_PAGE_INSTANCE_ID })
+        .catch(function () {});
     },
     { capture: true }
   );
@@ -132,6 +150,7 @@
       chrome.runtime.sendMessage({
         type: 'BRIDGE_FORWARD',
         requestId,
+        pageInstanceId: CG_PAGE_INSTANCE_ID,
         payload: message
       }, (bridgeResponse) => {
         const lastErr = chrome.runtime.lastError;

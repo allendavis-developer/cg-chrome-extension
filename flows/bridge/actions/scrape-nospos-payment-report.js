@@ -186,7 +186,7 @@ async function openNosposPaymentReportTab(appTabId, url) {
   return tab.id;
 }
 
-async function handleBridgeAction_scrapeNosposPaymentReport({ requestId, appTabId, payload }) {
+async function handleBridgeAction_scrapeNosposPaymentReport({ requestId, appTabId, pageInstanceId, payload }) {
   const emitProgress = (data) => {
     if (!appTabId) return;
     chrome.tabs
@@ -210,7 +210,7 @@ async function handleBridgeAction_scrapeNosposPaymentReport({ requestId, appTabI
     }
   }
 
-  nosposAbort.begin(appTabId);
+  nosposAbort.begin(appTabId, pageInstanceId);
 
   const rows = [];
   const seen = new Set();
@@ -221,7 +221,7 @@ async function handleBridgeAction_scrapeNosposPaymentReport({ requestId, appTabI
     // Checked before each page rather than after the walk: a report that runs
     // to two hundred pages must stop within one fetch of being told to.
     if (nosposAbort.isAborted(appTabId)) {
-      return { ok: false, aborted: true, error: 'Stopped — the page that started this went away.', rows, tabId };
+      return { ok: false, aborted: true, error: `Stopped — ${nosposAbort.reasonFor(appTabId) || 'the page that started this went away'}.`, rows, tabId };
     }
     page += 1;
     const url = nosposPaymentReportUrl(page, fromDate, toDate);

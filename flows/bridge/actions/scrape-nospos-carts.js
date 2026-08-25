@@ -157,7 +157,7 @@ function parseNosposCartPage(html, url) {
   };
 }
 
-async function handleBridgeAction_scrapeNosposCarts({ requestId, appTabId, payload }) {
+async function handleBridgeAction_scrapeNosposCarts({ requestId, appTabId, pageInstanceId, payload }) {
   const urls = Array.isArray(payload?.urls) ? payload.urls.filter(Boolean) : [];
   if (!urls.length) return { ok: false, error: 'No sale links were supplied.' };
   if (urls.length > NOSPOS_CART_MAX) {
@@ -180,7 +180,7 @@ async function handleBridgeAction_scrapeNosposCarts({ requestId, appTabId, paylo
   // Was a one-at-a-time walk; see scrape-nospos-agreements.js for the shape.
   // A fresh walk for this tab clears any earlier stop, so one abort cannot
   // poison every later capture from the same page.
-  nosposAbort.begin(appTabId);
+  nosposAbort.begin(appTabId, pageInstanceId);
   const stopped = () => nosposAbort.isAborted(appTabId);
   let loginRequired = false;
   const carts = [];

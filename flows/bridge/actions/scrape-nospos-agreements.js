@@ -256,7 +256,7 @@ function parseNosposAgreementPage(html, url) {
   };
 }
 
-async function handleBridgeAction_scrapeNosposAgreements({ requestId, appTabId, payload }) {
+async function handleBridgeAction_scrapeNosposAgreements({ requestId, appTabId, pageInstanceId, payload }) {
   const urls = Array.isArray(payload?.urls) ? payload.urls.filter(Boolean) : [];
   if (!urls.length) return { ok: false, error: 'No agreement links were supplied.' };
   if (urls.length > NOSPOS_AGREEMENT_MAX) {
@@ -284,7 +284,7 @@ async function handleBridgeAction_scrapeNosposAgreements({ requestId, appTabId, 
   // several at once and stands down on its own when NosPos throttles.
   // A fresh walk for this tab clears any earlier stop, so one abort cannot
   // poison every later capture from the same page.
-  nosposAbort.begin(appTabId);
+  nosposAbort.begin(appTabId, pageInstanceId);
   const stopped = () => nosposAbort.isAborted(appTabId);
   let loginRequired = false;
   const agreements = [];
@@ -401,7 +401,7 @@ async function handleBridgeAction_scrapeNosposAgreements({ requestId, appTabId, 
   }
 
   if (stopped()) {
-    return { ok: false, aborted: true, error: 'Stopped — the page that started this went away.', agreements };
+    return { ok: false, aborted: true, error: `Stopped — ${nosposAbort.reasonFor(appTabId) || 'the page that started this went away'}.`, agreements };
   }
 
   console.log('[CG Suite] agreements scraped', { ok: agreements.length, failed: failures.length });

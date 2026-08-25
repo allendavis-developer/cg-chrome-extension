@@ -45,7 +45,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // page, so without this a capture carries on fetching for a tab that no
       // longer exists — which is how a closed tab kept hammering NosPos until
       // the extension itself was removed.
-      nosposAbort.abort(tabId);
+      nosposAbort.abortInstance(
+        tabId, message.pageInstanceId, 'the page that started it went away',
+      );
       void closeWebEposUploadSessionForAppTab(tabId);
     }
     sendResponse({ ok: true });

@@ -9,6 +9,10 @@
 async function handleBridgeForward(message, sender) {
   const { requestId, payload } = message;
   const appTabId = sender.tab?.id;
+  // Which injection of the content bridge this came from. A tab id alone cannot
+  // tell one page load from the next, and a NosPos walk has to know whether a
+  // stop belongs to the page that started it — see bg/nospos-abort.js.
+  const pageInstanceId = message.pageInstanceId || '';
 
   const action = payload?.action;
   const handler = action != null ? BRIDGE_ACTIONS[action] : null;
@@ -17,7 +21,7 @@ async function handleBridgeForward(message, sender) {
   }
 
   try {
-    return await handler({ requestId, appTabId, payload });
+    return await handler({ requestId, appTabId, pageInstanceId, payload });
   } catch (e) {
     return {
       ok: false,

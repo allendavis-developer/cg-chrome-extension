@@ -13,7 +13,7 @@ async function handleBridgeAction_cancelRequest({ requestId, appTabId, payload }
   // button on a master-only screen. "The user pressed cancel in the app" is
   // already what this action means, so a capture is simply another thing it
   // has to stop.
-  nosposAbort.abort(appTabId);
+  nosposAbort.abort(appTabId, 'you pressed stop');
 
   // User clicked Cancel/Reset in the app while a listing tab was open.
   // Find the pending entry for this app tab, close the listing tab, and

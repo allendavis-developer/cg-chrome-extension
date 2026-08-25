@@ -178,6 +178,10 @@ async function handleBridgeAction_scrapeNosposCarts({ requestId, appTabId, paylo
 
   // ── Phase 1: every cart page, concurrently. ────────────────────────────
   // Was a one-at-a-time walk; see scrape-nospos-agreements.js for the shape.
+  // A fresh walk for this tab clears any earlier stop, so one abort cannot
+  // poison every later capture from the same page.
+  nosposAbort.begin(appTabId);
+  const stopped = () => nosposAbort.isAborted(appTabId);
   let loginRequired = false;
   const carts = [];
   const failures = [];
@@ -189,7 +193,7 @@ async function handleBridgeAction_scrapeNosposCarts({ requestId, appTabId, paylo
       return { url, r };
     },
     {
-      shouldStop: () => loginRequired,
+      shouldStop: () => loginRequired || stopped(),
       onProgress: (done, total, entry) => {
         if (entry?.ok && entry.value?.r?.loginRequired) loginRequired = true;
         emitProgress({ done, total, failures: failures.length, stage: 'cart' });
@@ -241,6 +245,7 @@ async function handleBridgeAction_scrapeNosposCarts({ requestId, appTabId, paylo
           return { stockId, stockUrl, r };
         },
         {
+          shouldStop: stopped,
           onProgress: (done, total) => emitProgress({
             done, total, failures: failures.length, stage: 'stock',
           }),

@@ -210,12 +210,19 @@ async function handleBridgeAction_scrapeNosposPaymentReport({ requestId, appTabI
     }
   }
 
+  nosposAbort.begin(appTabId);
+
   const rows = [];
   const seen = new Set();
   let hasMore = true;
   let page = 0;
 
   while (hasMore) {
+    // Checked before each page rather than after the walk: a report that runs
+    // to two hundred pages must stop within one fetch of being told to.
+    if (nosposAbort.isAborted(appTabId)) {
+      return { ok: false, aborted: true, error: 'Stopped — the page that started this went away.', rows, tabId };
+    }
     page += 1;
     const url = nosposPaymentReportUrl(page, fromDate, toDate);
     if (page > NOSPOS_PAYMENT_REPORT_MAX_PAGES) {

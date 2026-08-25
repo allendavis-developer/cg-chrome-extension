@@ -7,6 +7,14 @@
 async function handleBridgeAction_cancelRequest({ requestId, appTabId, payload }) {
   if (appTabId == null) return { ok: false, error: 'No app tab' };
 
+  // Stop any NosPos walk this tab started. Handled here rather than through a
+  // new bridge action on purpose: a NEW required action means a protocol bump,
+  // and a protocol bump locks every operator out of their modules over a Stop
+  // button on a master-only screen. "The user pressed cancel in the app" is
+  // already what this action means, so a capture is simply another thing it
+  // has to stop.
+  nosposAbort.abort(appTabId);
+
   // User clicked Cancel/Reset in the app while a listing tab was open.
   // Find the pending entry for this app tab, close the listing tab, and
   // send a clean cancelled response so the app's awaiting promise resolves.

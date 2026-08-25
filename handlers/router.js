@@ -41,6 +41,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'CG_APP_PAGE_UNLOADING') {
     const tabId = sender.tab?.id;
     if (tabId != null) {
+      // Stop any NosPos walk this tab started. The service worker outlives the
+      // page, so without this a capture carries on fetching for a tab that no
+      // longer exists — which is how a closed tab kept hammering NosPos until
+      // the extension itself was removed.
+      nosposAbort.abort(tabId);
       void closeWebEposUploadSessionForAppTab(tabId);
     }
     sendResponse({ ok: true });

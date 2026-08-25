@@ -28,6 +28,8 @@ importScripts(
   'bg/tab-utils.js',
   'bg/nospos-url-utils.js',
   'bg/nospos-html.js',
+  // Before the pool and every scrape action: they ask it whether to stop.
+  'bg/nospos-abort.js',
   // After nospos-html.js: it assigns that file's NOSPOS_FETCH_OBSERVER hook.
   'bg/nospos-pool.js',
   'sdk/park-ui.js',

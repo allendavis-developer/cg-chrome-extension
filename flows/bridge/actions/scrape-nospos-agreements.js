@@ -282,6 +282,10 @@ async function handleBridgeAction_scrapeNosposAgreements({ requestId, appTabId, 
   // This used to be a `for … await` loop — one page in flight at a time, the
   // next request not even sent until the last had been parsed. The pool runs
   // several at once and stands down on its own when NosPos throttles.
+  // A fresh walk for this tab clears any earlier stop, so one abort cannot
+  // poison every later capture from the same page.
+  nosposAbort.begin(appTabId);
+  const stopped = () => nosposAbort.isAborted(appTabId);
   let loginRequired = false;
   const agreements = [];
   const failures = [];
@@ -293,7 +297,7 @@ async function handleBridgeAction_scrapeNosposAgreements({ requestId, appTabId, 
       return { url, r };
     },
     {
-      shouldStop: () => loginRequired,
+      shouldStop: () => loginRequired || stopped(),
       onProgress: (done, total, entry) => {
         if (entry?.ok && entry.value?.r?.loginRequired) loginRequired = true;
         emitProgress({ done, total, failures: failures.length, stage: 'agreement' });
@@ -354,6 +358,7 @@ async function handleBridgeAction_scrapeNosposAgreements({ requestId, appTabId, 
           return { stockId, stockUrl, r };
         },
         {
+          shouldStop: stopped,
           onProgress: (done, total) => emitProgress({
             done, total, failures: failures.length, stage: 'stock',
           }),
@@ -393,6 +398,10 @@ async function handleBridgeAction_scrapeNosposAgreements({ requestId, appTabId, 
         items.forEach((item) => { item.stock = { ...stock, html: r.html }; });
       });
     }
+  }
+
+  if (stopped()) {
+    return { ok: false, aborted: true, error: 'Stopped — the page that started this went away.', agreements };
   }
 
   console.log('[CG Suite] agreements scraped', { ok: agreements.length, failed: failures.length });

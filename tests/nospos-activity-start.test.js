@@ -27,5 +27,48 @@ check('reads a comma count', sandbox.parseNosposActivityCount('<strong>Count</st
 check('reads an empty count', sandbox.parseNosposActivityCount('<strong>Count</strong><span>0</span>'), 0);
 check('falls back to a real row', sandbox.parseNosposActivityCount('<tr data-key="4"><td>x</td></tr>'), 1);
 
-if (failures) process.exit(1);
-console.log('\nall good');
+const first = new Date('2015-01-01T00:00:00Z');
+const last = new Date('2021-12-31T00:00:00Z');
+check('the search range becomes 366 legal windows', sandbox.nosposActivityWindowCount(first, last), 366);
+check('window zero begins at the lower bound', sandbox.nosposActivityIsoDay(sandbox.nosposActivityWindowAt(first, last, 0).start), '2015-01-01');
+check('window one advances exactly seven days', sandbox.nosposActivityIsoDay(sandbox.nosposActivityWindowAt(first, last, 1).start), '2015-01-08');
+check('the final window is capped at the upper bound', sandbox.nosposActivityIsoDay(sandbox.nosposActivityWindowAt(first, last, 365).end), '2021-12-31');
+
+async function checkBinaryWalk() {
+  const actualStart = '2019-05-06';
+  let requests = 0;
+  sandbox.chrome = { tabs: { sendMessage: () => Promise.resolve() } };
+  sandbox.nosposAbort = {
+    begin: () => {},
+    isAborted: () => false,
+    reasonFor: () => '',
+  };
+  sandbox.nosposCredentialedHtmlFetch = async (value) => {
+    requests += 1;
+    const request = new URL(value);
+    const from = request.searchParams.get('ActivityReport[from_time]').slice(0, 10);
+    const to = request.searchParams.get('ActivityReport[to_time]').slice(0, 10);
+    const populated = to >= actualStart && (from === to ? from >= actualStart : true);
+    return {
+      ok: true,
+      html: `<strong>Count</strong><span>${populated ? 4 : 0}</span>`,
+      finalUrl: value,
+    };
+  };
+
+  const result = await sandbox.handleBridgeAction_findNosposActivityStart({
+    requestId: 'test', appTabId: 1, pageInstanceId: 'page',
+  });
+  check('binary walk finds the exact day', result.startDate, actualStart);
+  check('binary search is at most ten weekly requests', result.windowsChecked <= 10, true);
+  check('exact-day narrowing is at most seven requests', result.daysChecked <= 7, true);
+  check('the whole discovery stays tiny', requests <= 17, true);
+}
+
+checkBinaryWalk().then(() => {
+  if (failures) process.exit(1);
+  console.log('\nall good');
+}).catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

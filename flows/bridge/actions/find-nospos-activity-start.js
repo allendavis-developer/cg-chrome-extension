@@ -1,13 +1,12 @@
 /**
  * Find the first day for which NosPos's management Activity report contains
- * anything. NosPos refuses report windows longer than seven days, so the walk
- * checks consecutive seven-day windows from 2015 through 2021, then checks the
- * seven individual days in the first populated window.
+ * anything. NosPos refuses report windows longer than seven days, so the range
+ * is divided into legal seven-day windows and binary-searched. Once the first
+ * populated window is found, its seven individual days are checked in order.
  *
- * A binary search over weeks would be wrong here: "this week has activity" is
- * not monotonic because a real branch can have a quiet week. The bounded weekly
- * scan is still only 366 small, one-row report requests in the worst case and
- * cannot skip an older isolated record.
+ * A trading branch's report is treated as a boundary: empty before the branch
+ * began, populated afterwards. That turns roughly 366 weekly requests into at
+ * most ten, followed by at most seven day requests.
  */
 
 const NOSPOS_ACTIVITY_REPORT_URL = 'https://nospos.com/reports/management/activity/index';
@@ -43,6 +42,20 @@ function nosposActivityAddDays(date, days) {
   const copy = new Date(date.getTime());
   copy.setUTCDate(copy.getUTCDate() + days);
   return copy;
+}
+
+function nosposActivityWindowCount(firstAllowed, lastAllowed) {
+  const days = Math.floor((lastAllowed.getTime() - firstAllowed.getTime()) / 86400000) + 1;
+  return Math.ceil(days / NOSPOS_ACTIVITY_WINDOW_DAYS);
+}
+
+function nosposActivityWindowAt(firstAllowed, lastAllowed, index) {
+  const start = nosposActivityAddDays(firstAllowed, index * NOSPOS_ACTIVITY_WINDOW_DAYS);
+  const end = new Date(Math.min(
+    nosposActivityAddDays(start, NOSPOS_ACTIVITY_WINDOW_DAYS - 1).getTime(),
+    lastAllowed.getTime(),
+  ));
+  return { start, end };
 }
 
 function nosposActivityReportUrl(fromDay, toDay) {
@@ -86,45 +99,62 @@ async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId,
   nosposAbort.begin(appTabId, pageInstanceId);
   const firstAllowed = new Date(`${NOSPOS_ACTIVITY_SEARCH_FROM}T00:00:00Z`);
   const lastAllowed = new Date(`${NOSPOS_ACTIVITY_SEARCH_TO}T00:00:00Z`);
-  let cursor = firstAllowed;
+  const totalWindows = nosposActivityWindowCount(firstAllowed, lastAllowed);
+  const maximumBinarySteps = Math.ceil(Math.log2(totalWindows)) + 1;
   let windowsChecked = 0;
-  let populatedWindow = null;
+  let low = 0;
+  let high = totalWindows - 1;
+  const probes = new Map();
 
-  while (cursor <= lastAllowed) {
+  const probeWindow = async (index) => {
+    if (probes.has(index)) return probes.get(index);
     if (nosposAbort.isAborted(appTabId)) {
+      return { aborted: true };
+    }
+    const window = nosposActivityWindowAt(firstAllowed, lastAllowed, index);
+    const fromDay = nosposActivityIsoDay(window.start);
+    const toDay = nosposActivityIsoDay(window.end);
+    const response = await nosposCredentialedHtmlFetch(nosposActivityReportUrl(fromDay, toDay));
+    if (response.loginRequired) return { loginRequired: true };
+    if (!response.ok) return { error: response.error || 'Could not read the NosPos activity report.' };
+    windowsChecked += 1;
+    const count = parseNosposActivityCount(response.html);
+    const found = { ...window, fromDay, toDay, count };
+    probes.set(index, found);
+    emitProgress({
+      phase: 'binary',
+      fromDay,
+      toDay,
+      count,
+      windowsChecked,
+      maximumBinarySteps,
+      remainingWindows: high - low + 1,
+    });
+    return found;
+  };
+
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    // eslint-disable-next-line no-await-in-loop
+    const probe = await probeWindow(mid);
+    if (probe.aborted) {
       return {
         ok: false,
         aborted: true,
         error: `Stopped — ${nosposAbort.reasonFor(appTabId) || 'the page that started it went away'}.`,
       };
     }
-
-    const windowEnd = new Date(Math.min(
-      nosposActivityAddDays(cursor, NOSPOS_ACTIVITY_WINDOW_DAYS - 1).getTime(),
-      lastAllowed.getTime(),
-    ));
-    const fromDay = nosposActivityIsoDay(cursor);
-    const toDay = nosposActivityIsoDay(windowEnd);
-    // eslint-disable-next-line no-await-in-loop
-    const response = await nosposCredentialedHtmlFetch(nosposActivityReportUrl(fromDay, toDay));
-    if (response.loginRequired) return { ok: false, loginRequired: true };
-    if (!response.ok) return { ok: false, error: response.error || 'Could not read the NosPos activity report.' };
-
-    windowsChecked += 1;
-    const count = parseNosposActivityCount(response.html);
-    emitProgress({ phase: 'weeks', fromDay, toDay, count, windowsChecked });
-    if (count > 0) {
-      populatedWindow = { start: cursor, end: windowEnd, count };
-      break;
-    }
-
-    cursor = nosposActivityAddDays(cursor, NOSPOS_ACTIVITY_WINDOW_DAYS);
-    // Avoid turning a bounded discovery pass into a burst against NosPos.
-    // eslint-disable-next-line no-await-in-loop
-    await nosposHtmlFetchSleep(120);
+    if (probe.loginRequired) return { ok: false, loginRequired: true };
+    if (probe.error) return { ok: false, error: probe.error };
+    if (probe.count > 0) high = mid;
+    else low = mid + 1;
   }
 
-  if (!populatedWindow) {
+  const populatedWindow = await probeWindow(low);
+  if (populatedWindow.aborted) return { ok: false, aborted: true, error: 'Stopped.' };
+  if (populatedWindow.loginRequired) return { ok: false, loginRequired: true };
+  if (populatedWindow.error) return { ok: false, error: populatedWindow.error };
+  if (populatedWindow.count < 1) {
     return {
       ok: false,
       notFound: true,
@@ -158,6 +188,7 @@ async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId,
           count: populatedWindow.count,
         },
         windowsChecked,
+        searchMethod: 'binary',
         daysChecked,
         searchFrom: NOSPOS_ACTIVITY_SEARCH_FROM,
         searchTo: NOSPOS_ACTIVITY_SEARCH_TO,

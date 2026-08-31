@@ -42,6 +42,7 @@ const BRIDGE_ACTIONS = {
   deleteExcludedNosposAgreementLines: handleBridgeAction_deleteExcludedNosposAgreementLines,
   clickNosposSidebarParkAgreement: handleBridgeAction_clickNosposSidebarParkAgreement,
   focusOrOpenNosposParkTab: handleBridgeAction_focusOrOpenNosposParkTab,
+  findNosposActivityStart: handleBridgeAction_findNosposActivityStart,
   getNosposTabUrl: handleBridgeAction_getNosposTabUrl,
   closeNosposParkAgreementTab: handleBridgeAction_closeNosposParkAgreementTab,
   fillNosposParkAgreementCategory: handleBridgeAction_fillNosposParkAgreementCategory,

@@ -67,4 +67,4 @@ var CG_MSG = {
  * The marketing version in manifest.json moves independently (semver-ish for
  * users); this integer is the only thing the runtime compares against.
  */
-var CG_EXT_PROTOCOL_VERSION = 8;
+var CG_EXT_PROTOCOL_VERSION = 9;

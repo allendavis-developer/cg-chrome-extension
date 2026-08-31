@@ -1,12 +1,15 @@
 /**
  * Find the first day for which NosPos's management Activity report contains
  * anything. NosPos refuses report windows longer than seven days, so the range
- * is divided into legal seven-day windows and binary-searched. Once the first
- * populated window is found, its seven individual days are checked in order.
+ * is divided into legal seven-day windows and checked in small parallel batches.
+ * Once the first populated window is found, its seven individual days are
+ * checked in order.
  *
- * A trading branch's report is treated as a boundary: empty before the branch
- * began, populated afterwards. That turns roughly 366 weekly requests into at
- * most ten, followed by at most seven day requests.
+ * This deliberately is NOT a binary search. A weekly report can be empty after
+ * a branch started (closures, gaps, incomplete history), so "this week has
+ * activity" is not a monotonic predicate and binary search can return a later
+ * 0→1 transition. Parallel chronological batches keep the wall-clock time low
+ * while still proving that no earlier permitted window contains activity.
  */
 
 const NOSPOS_ACTIVITY_REPORT_URL = 'https://nospos.com/reports/management/activity/index';
@@ -81,9 +84,10 @@ function parseNosposActivityCount(html) {
     const count = Number.parseInt(match[1].replace(/,/g, ''), 10);
     if (Number.isFinite(count)) return count;
   }
-  // Defensive fallback for a changed Summary card: any real activity row has
-  // a data-key, so this preserves the only distinction the search needs.
-  return /<tr\b[^>]*\bdata-key="[^"]+"/i.test(source) ? 1 : 0;
+  // Never infer a count from other markup. The supplied page can contain
+  // unrelated data-key attributes even while Activity says "No results found".
+  // An unreadable Summary is an error, not evidence of one event.
+  return null;
 }
 
 async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId, pageInstanceId }) {
@@ -100,14 +104,11 @@ async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId,
   const firstAllowed = new Date(`${NOSPOS_ACTIVITY_SEARCH_FROM}T00:00:00Z`);
   const lastAllowed = new Date(`${NOSPOS_ACTIVITY_SEARCH_TO}T00:00:00Z`);
   const totalWindows = nosposActivityWindowCount(firstAllowed, lastAllowed);
-  const maximumBinarySteps = Math.ceil(Math.log2(totalWindows)) + 1;
+  const parallelism = 6;
   let windowsChecked = 0;
-  let low = 0;
-  let high = totalWindows - 1;
-  const probes = new Map();
+  let populatedWindow = null;
 
   const probeWindow = async (index) => {
-    if (probes.has(index)) return probes.get(index);
     if (nosposAbort.isAborted(appTabId)) {
       return { aborted: true };
     }
@@ -119,42 +120,49 @@ async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId,
     if (!response.ok) return { error: response.error || 'Could not read the NosPos activity report.' };
     windowsChecked += 1;
     const count = parseNosposActivityCount(response.html);
+    if (count == null) {
+      return { error: `NosPos returned ${fromDay} to ${toDay}, but its Summary count could not be read.` };
+    }
     const found = { ...window, fromDay, toDay, count };
-    probes.set(index, found);
     emitProgress({
-      phase: 'binary',
+      phase: 'weeks',
       fromDay,
       toDay,
       count,
       windowsChecked,
-      maximumBinarySteps,
-      remainingWindows: high - low + 1,
+      totalWindows,
     });
     return found;
   };
 
-  while (low < high) {
-    const mid = Math.floor((low + high) / 2);
+  for (let batchStart = 0; batchStart < totalWindows; batchStart += parallelism) {
+    if (nosposAbort.isAborted(appTabId)) {
+      return { ok: false, aborted: true, error: 'Stopped.' };
+    }
+    const indices = Array.from(
+      { length: Math.min(parallelism, totalWindows - batchStart) },
+      (_, offset) => batchStart + offset,
+    );
+    // Six small report requests at a time: fast enough for discovery without
+    // sending hundreds at once or retaining any HTML after its count is read.
     // eslint-disable-next-line no-await-in-loop
-    const probe = await probeWindow(mid);
-    if (probe.aborted) {
+    const batch = await Promise.all(indices.map((index) => probeWindow(index)));
+    const aborted = batch.find((probe) => probe.aborted);
+    if (aborted) {
       return {
         ok: false,
         aborted: true,
         error: `Stopped — ${nosposAbort.reasonFor(appTabId) || 'the page that started it went away'}.`,
       };
     }
-    if (probe.loginRequired) return { ok: false, loginRequired: true };
-    if (probe.error) return { ok: false, error: probe.error };
-    if (probe.count > 0) high = mid;
-    else low = mid + 1;
+    if (batch.some((probe) => probe.loginRequired)) return { ok: false, loginRequired: true };
+    const failed = batch.find((probe) => probe.error);
+    if (failed) return { ok: false, error: failed.error };
+    populatedWindow = batch.find((probe) => probe.count > 0) || null;
+    if (populatedWindow) break;
   }
 
-  const populatedWindow = await probeWindow(low);
-  if (populatedWindow.aborted) return { ok: false, aborted: true, error: 'Stopped.' };
-  if (populatedWindow.loginRequired) return { ok: false, loginRequired: true };
-  if (populatedWindow.error) return { ok: false, error: populatedWindow.error };
-  if (populatedWindow.count < 1) {
+  if (!populatedWindow) {
     return {
       ok: false,
       notFound: true,
@@ -188,7 +196,7 @@ async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId,
           count: populatedWindow.count,
         },
         windowsChecked,
-        searchMethod: 'binary',
+        searchMethod: 'parallel_weekly',
         daysChecked,
         searchFrom: NOSPOS_ACTIVITY_SEARCH_FROM,
         searchTo: NOSPOS_ACTIVITY_SEARCH_TO,

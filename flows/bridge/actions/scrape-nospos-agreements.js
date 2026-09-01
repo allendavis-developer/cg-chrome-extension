@@ -217,6 +217,11 @@ function parseNosposStockPageExtras(html) {
   const grade = nosposSelectedOption(html, 'stock-grade');
   const category = nosposSelectedOption(html, 'stock-category');
   return {
+    // The label physically on the item. It is printed right there in the stock
+    // page's own summary and was simply never read, so every migrated unit
+    // arrived with an empty barcode - and a scan of the real sticker at the
+    // till found nothing at all.
+    barserial: details.Barserial || '',
     stock_type: details.Type || '',            // "Bought", "Traded", …
     total_quantity: details['Total Quantity'] || '',
     created_by: details['Created By'] || '',

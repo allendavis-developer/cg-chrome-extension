@@ -1,15 +1,10 @@
 /**
  * Find the first day for which NosPos's management Activity report contains
  * anything. NosPos refuses report windows longer than seven days, so the range
- * is divided into legal seven-day windows and checked in small parallel batches.
- * Once the first populated window is found, its seven individual days are
- * checked in order.
- *
- * This deliberately is NOT a binary search. A weekly report can be empty after
- * a branch started (closures, gaps, incomplete history), so "this week has
- * activity" is not a monotonic predicate and binary search can return a later
- * 0→1 transition. Parallel chronological batches keep the wall-clock time low
- * while still proving that no earlier permitted window contains activity.
+ * is divided into legal seven-day windows and binary-searched by Summary count.
+ * A populated middle window moves the upper bound down; an empty one moves the
+ * lower bound up. Once the first populated window is found, its seven
+ * individual days are checked in order.
  */
 
 const NOSPOS_ACTIVITY_REPORT_URL = 'https://nospos.com/reports/management/activity/index';
@@ -76,18 +71,38 @@ function nosposActivityReportUrl(fromDay, toDay) {
   return `${NOSPOS_ACTIVITY_REPORT_URL}?${params.toString()}`;
 }
 
-/** "<strong>Count</strong><span>1,128</span>" -> 1128. */
-function parseNosposActivityCount(html) {
+const NOSPOS_ACTIVITY_MONTHS = {
+  jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+  jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
+};
+
+function parseNosposActivitySummaryDay(value) {
+  const text = String(value || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  const match = text.match(/\b(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\b/);
+  if (!match) return null;
+  const month = NOSPOS_ACTIVITY_MONTHS[match[2].toLowerCase()];
+  if (!month) return null;
+  return `${match[3]}-${month}-${String(match[1]).padStart(2, '0')}`;
+}
+
+/** Read only the Activity report's Summary card, including its echoed range. */
+function parseNosposActivitySummary(html) {
   const source = String(html || '');
-  const match = source.match(/<strong>\s*Count\s*<\/strong>\s*<span[^>]*>\s*([\d,]+)\s*<\/span>/i);
-  if (match) {
-    const count = Number.parseInt(match[1].replace(/,/g, ''), 10);
-    if (Number.isFinite(count)) return count;
-  }
-  // Never infer a count from other markup. The supplied page can contain
-  // unrelated data-key attributes even while Activity says "No results found".
-  // An unreadable Summary is an error, not evidence of one event.
-  return null;
+  const summaryMatch = source.match(/<div[^>]+id=["']w0["'][^>]*>([\s\S]*?)<\/div>\s*<\/div>/i);
+  const summary = summaryMatch ? summaryMatch[1] : source;
+  const valueFor = (label) => {
+    const match = summary.match(new RegExp(`<strong>\\s*${label}\\s*<\\/strong>\\s*<span[^>]*>([\\s\\S]*?)<\\/span>`, 'i'));
+    return match ? match[1] : '';
+  };
+  const countText = valueFor('Count').replace(/<[^>]*>/g, '').trim();
+  const count = /^\d[\d,]*$/.test(countText)
+    ? Number.parseInt(countText.replace(/,/g, ''), 10)
+    : null;
+  return {
+    fromDay: parseNosposActivitySummaryDay(valueFor('From')),
+    toDay: parseNosposActivitySummaryDay(valueFor('To')),
+    count: Number.isFinite(count) ? count : null,
+  };
 }
 
 async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId, pageInstanceId }) {
@@ -104,11 +119,14 @@ async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId,
   const firstAllowed = new Date(`${NOSPOS_ACTIVITY_SEARCH_FROM}T00:00:00Z`);
   const lastAllowed = new Date(`${NOSPOS_ACTIVITY_SEARCH_TO}T00:00:00Z`);
   const totalWindows = nosposActivityWindowCount(firstAllowed, lastAllowed);
-  const parallelism = 6;
+  const maximumBinarySteps = Math.ceil(Math.log2(totalWindows)) + 1;
   let windowsChecked = 0;
-  let populatedWindow = null;
+  let low = 0;
+  let high = totalWindows - 1;
+  const probes = new Map();
 
   const probeWindow = async (index) => {
+    if (probes.has(index)) return probes.get(index);
     if (nosposAbort.isAborted(appTabId)) {
       return { aborted: true };
     }
@@ -119,50 +137,48 @@ async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId,
     if (response.loginRequired) return { loginRequired: true };
     if (!response.ok) return { error: response.error || 'Could not read the NosPos activity report.' };
     windowsChecked += 1;
-    const count = parseNosposActivityCount(response.html);
-    if (count == null) {
+    const summary = parseNosposActivitySummary(response.html);
+    if (summary.count == null) {
       return { error: `NosPos returned ${fromDay} to ${toDay}, but its Summary count could not be read.` };
     }
+    const count = summary.count;
     const found = { ...window, fromDay, toDay, count };
+    probes.set(index, found);
     emitProgress({
-      phase: 'weeks',
+      phase: 'binary',
       fromDay,
       toDay,
       count,
       windowsChecked,
       totalWindows,
+      maximumBinarySteps,
+      remainingWindows: high - low + 1,
     });
     return found;
   };
 
-  for (let batchStart = 0; batchStart < totalWindows; batchStart += parallelism) {
-    if (nosposAbort.isAborted(appTabId)) {
-      return { ok: false, aborted: true, error: 'Stopped.' };
-    }
-    const indices = Array.from(
-      { length: Math.min(parallelism, totalWindows - batchStart) },
-      (_, offset) => batchStart + offset,
-    );
-    // Six small report requests at a time: fast enough for discovery without
-    // sending hundreds at once or retaining any HTML after its count is read.
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
     // eslint-disable-next-line no-await-in-loop
-    const batch = await Promise.all(indices.map((index) => probeWindow(index)));
-    const aborted = batch.find((probe) => probe.aborted);
-    if (aborted) {
+    const probe = await probeWindow(mid);
+    if (probe.aborted) {
       return {
         ok: false,
         aborted: true,
         error: `Stopped — ${nosposAbort.reasonFor(appTabId) || 'the page that started it went away'}.`,
       };
     }
-    if (batch.some((probe) => probe.loginRequired)) return { ok: false, loginRequired: true };
-    const failed = batch.find((probe) => probe.error);
-    if (failed) return { ok: false, error: failed.error };
-    populatedWindow = batch.find((probe) => probe.count > 0) || null;
-    if (populatedWindow) break;
+    if (probe.loginRequired) return { ok: false, loginRequired: true };
+    if (probe.error) return { ok: false, error: probe.error };
+    if (probe.count > 0) high = mid;
+    else low = mid + 1;
   }
 
-  if (!populatedWindow) {
+  const populatedWindow = await probeWindow(low);
+  if (populatedWindow.aborted) return { ok: false, aborted: true, error: 'Stopped.' };
+  if (populatedWindow.loginRequired) return { ok: false, loginRequired: true };
+  if (populatedWindow.error) return { ok: false, error: populatedWindow.error };
+  if (populatedWindow.count < 1) {
     return {
       ok: false,
       notFound: true,
@@ -183,7 +199,11 @@ async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId,
     if (response.loginRequired) return { ok: false, loginRequired: true };
     if (!response.ok) return { ok: false, error: response.error || 'Could not confirm the first activity day.' };
     daysChecked += 1;
-    const count = parseNosposActivityCount(response.html);
+    const summary = parseNosposActivitySummary(response.html);
+    if (summary.count == null) {
+      return { ok: false, error: `NosPos returned ${date}, but its Summary count could not be read.` };
+    }
+    const count = summary.count;
     emitProgress({ phase: 'days', fromDay: date, toDay: date, count, windowsChecked, daysChecked });
     if (count > 0) {
       return {
@@ -196,7 +216,7 @@ async function handleBridgeAction_findNosposActivityStart({ requestId, appTabId,
           count: populatedWindow.count,
         },
         windowsChecked,
-        searchMethod: 'parallel_weekly',
+        searchMethod: 'binary_weekly',
         daysChecked,
         searchFrom: NOSPOS_ACTIVITY_SEARCH_FROM,
         searchTo: NOSPOS_ACTIVITY_SEARCH_TO,

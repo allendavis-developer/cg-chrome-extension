@@ -30,7 +30,13 @@ var NOSPOS_HTML_FETCH_HEADERS = {
  *   | { ok: false, loginRequired: true }
  *   | { ok: false, error: string }>}
  */
-var NOSPOS_HTML_FETCH_RETRY_DELAYS_MS = [400, 900, 1600];
+// Five attempts, out to ~13 seconds in total. The first three absorb an
+// ordinary blip; the last two exist for the case a migration crawl actually
+// hits, which is NosPos throttling a long walk. At 400/900/1600 a sustained
+// 429 exhausted the ladder in under three seconds and the page was recorded as
+// unreadable — a hole in the window that was never really missing, just asked
+// for too fast. Each delay is jittered and `Retry-After` still wins.
+var NOSPOS_HTML_FETCH_RETRY_DELAYS_MS = [400, 900, 1600, 3500, 7000];
 
 /**
  * Optional observer for fetch outcomes, set by bg/nospos-pool.js.

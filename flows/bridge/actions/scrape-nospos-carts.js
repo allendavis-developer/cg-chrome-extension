@@ -39,6 +39,23 @@ function nosposCartIdFromUrl(url) {
   return match ? match[1] : '';
 }
 
+/**
+ * Did this sale URL land on an agreement instead of a cart?
+ *
+ * An EasyPay (SA) ticket has no cart page of its own: `/newsales/cart/70112/view`
+ * REDIRECTS to `/agreement/view?id=117812`, because the goods are being paid off
+ * against the agreement rather than rung through a till. Following that quietly
+ * is what made the crawl stage nonsense — the page parses, `details.ID` is the
+ * AGREEMENT's id, and the result was a "cart" numbered 117812 with no items,
+ * while the sale actually asked for was never satisfied and sat unread for ever.
+ *
+ * Returns the agreement id, so the caller can say what this really is.
+ */
+function nosposAgreementIdFromCartUrl(url) {
+  const match = String(url || '').match(/\/agreement\/view\?id=(\d+)/i);
+  return match ? match[1] : '';
+}
+
 function nosposCartRowCell(table, row, header) {
   const index = table.headers.findIndex(
     (h) => h.toLowerCase() === String(header).toLowerCase(),
@@ -185,6 +202,8 @@ async function handleBridgeAction_scrapeNosposCarts({ requestId, appTabId, pageI
   let loginRequired = false;
   const carts = [];
   const failures = [];
+  // EasyPay tickets: a sale URL that landed on an agreement instead.
+  const redirects = [];
 
   const pageResults = await nosposFetchPool(
     urls,
@@ -216,7 +235,24 @@ async function handleBridgeAction_scrapeNosposCarts({ requestId, appTabId, pageI
       failures.push({ url, error: r.error || 'could not be read' });
       return;
     }
-    const cart = parseNosposCartPage(r.html, r.finalUrl || url);
+    // An EasyPay ticket redirects to its agreement and has no cart of its own.
+    // Recorded as what it is rather than parsed as a cart it is not — see
+    // `nosposAgreementIdFromCartUrl`. Additive field: an older Cash EPOS simply
+    // does not read `redirects`, and gets no junk cart from us either way.
+    const landedOn = r.finalUrl || url;
+    const easypayAgreementId = nosposAgreementIdFromCartUrl(landedOn);
+    if (easypayAgreementId) {
+      redirects.push({
+        // The sale we ASKED for, which is the thing the crawl is waiting on.
+        requested_url: url,
+        nospos_cart_id: nosposCartIdFromUrl(url),
+        nospos_agreement_id: easypayAgreementId,
+        final_url: landedOn,
+      });
+      return;
+    }
+    const cart = parseNosposCartPage(r.html, landedOn);
+    cart.requested_url = url;
     // Raw body for server-side staging; additive and optional.
     cart.html = r.html;
     carts.push(cart);
@@ -279,6 +315,8 @@ async function handleBridgeAction_scrapeNosposCarts({ requestId, appTabId, pageI
     }
   }
 
-  console.log('[CG Suite] carts scraped', { ok: carts.length, failed: failures.length });
-  return { ok: true, carts, failures };
+  console.log('[CG Suite] carts scraped', {
+    ok: carts.length, failed: failures.length, easypay: redirects.length,
+  });
+  return { ok: true, carts, failures, redirects };
 }

@@ -23,7 +23,44 @@
  */
 
 const NOSPOS_PAYMENT_REPORT_URL = 'https://nospos.com/reports/management/payment';
-const NOSPOS_PAYMENT_REPORT_MAX_PAGES = 200;
+
+/**
+ * A backstop, not a budget.
+ *
+ * This used to be 200 — 20,000 payments — and a busy branch asked for two
+ * months blew straight through it, ending the walk with "pagination loop
+ * suspected" and losing the whole capture. The window an operator asks for is
+ * their business; a page count is not evidence of a loop.
+ *
+ * A real loop is detected properly below, so this only exists to stop an
+ * unbounded walk if that detection is ever wrong.
+ */
+const NOSPOS_PAYMENT_REPORT_MAX_PAGES = 5000;
+
+/**
+ * How many consecutive pages may come back holding nothing we have not already
+ * read before we call it a loop.
+ *
+ * One such page is ordinary: the report is live, so a payment taken mid-walk can
+ * shift rows across a page boundary and a page can legitimately repeat its
+ * predecessor entirely. Three in a row is not ordinary — it means the pagination
+ * is handing back the same page whatever we ask for.
+ *
+ * Only the first pass uses this. A repair pass expects familiar rows by
+ * definition — see `walkOnce`.
+ */
+const NOSPOS_PAYMENT_REPORT_MAX_STALE_PAGES = 3;
+
+/**
+ * How many extra passes over the report we will make to close a shortfall.
+ *
+ * A pass is cheap next to the walk it repairs, and two of them is plenty: each
+ * one re-reads the whole report against the SAME seen-set, so a row the first
+ * pass stepped over is picked up by the second whatever position it has moved
+ * to. If two more passes still cannot make the count, the gap is not a shuffle
+ * and no number of retries will close it — say so instead of pretending.
+ */
+const NOSPOS_PAYMENT_REPORT_MAX_REPAIR_PASSES = 2;
 
 /**
  * The report URL for one page, with the date filter applied.
@@ -42,6 +79,28 @@ function nosposPaymentReportUrl(page, fromDate, toDate) {
   const params = new URLSearchParams();
   params.set('page', String(page));
   params.set('per-page', '100');
+  // A DETERMINISTIC order, and the single most important parameter here.
+  //
+  // Left to its default the report comes back ordered by time, which is not a
+  // key: payments taken in the same second have no defined order between them,
+  // and NosPos is free to return them differently on every request. Page 4 is
+  // then not "rows 301-400 of one list" but "rows 301-400 of whatever list it
+  // built this time", and a row that moved from the top of page 4 to the bottom
+  // of page 3 between the two fetches is never seen by either — silently, with
+  // nothing on screen to say a row went missing.
+  //
+  // That is not hypothetical. The 27 Jul - 27 Aug stage came back 1701 rows
+  // with payment ids 263109, 263110 and 264075 simply absent from the middle of
+  // an otherwise unbroken run, and the capture order showed whole page-fuls of
+  // 21, 24 and 25 Aug arriving after 26 Aug had already been read. The three
+  // lost rows were £558 of sales and £60 of refunds, and they were the whole of
+  // that stage's disagreement with NosPos's own trading report.
+  //
+  // Sorting by id fixes it at the source: ids are unique and never change, so
+  // the list is stable, and a payment taken mid-walk is appended after
+  // everything we have already read rather than shoved into the middle of it.
+  // `verifyCount` below is the backstop for if NosPos ever ignores this.
+  params.set('sort', 'id');
   params.set('PaymentSearch[fromDate]', fromDate || '');
   params.set('PaymentSearch[toDate]', toDate || '');
   params.set('PaymentSearch[type]', '');
@@ -118,6 +177,30 @@ function nosposPaymentTillId(cellHtml) {
 function nosposPaymentReceiptFileId(rowHtml) {
   const match = String(rowHtml || '').match(/\/protected-file\/view\?id=(\d+)/i);
   return match ? match[1] : '';
+}
+
+/**
+ * How many rows the report says it holds, from the grid's own summary line.
+ *
+ * Yii2 renders `Showing <b>1-100</b> of <b>1,704</b> items.` above every
+ * paginated grid, and that number is the report's own count of what matched the
+ * filter. It is the only independent check we have that a walk read everything:
+ * counting the pages proves nothing, and neither does finishing without an
+ * error, because a skipped row raises neither.
+ *
+ * Returns 0 when the line cannot be read — an unreadable summary must not be
+ * mistaken for a report holding nothing.
+ */
+function parseNosposGridTotal(html) {
+  if (!html) return 0;
+  const block = String(html).match(/<div\b[^>]*\bclass="[^"]*\bsummary\b[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+  if (!block) return 0;
+  const text = nosposPaymentCellText(block[1]);
+  // "Showing 1-100 of 1,704 items" — the count is the number after "of".
+  const match = text.match(/\bof\b\s*([\d,]+)/i);
+  if (!match) return 0;
+  const total = Number.parseInt(match[1].replace(/,/g, ''), 10);
+  return Number.isFinite(total) && total > 0 ? total : 0;
 }
 
 /**
@@ -214,45 +297,145 @@ async function handleBridgeAction_scrapeNosposPaymentReport({ requestId, appTabI
 
   const rows = [];
   const seen = new Set();
-  let hasMore = true;
-  let page = 0;
+  // What the report itself says it holds, read off the grid's summary line on
+  // every page. Kept as the highest number seen: the report is live, so a
+  // payment taken mid-walk raises it, and the walk has to reach the new figure
+  // rather than the one page 1 happened to quote.
+  let reportedTotal = 0;
+  let pages = 0;
+  // Set when the walk ended early - an abort, a fetch failure, a pagination
+  // loop. Carries the exact response to hand back, so one bail-out path serves
+  // the first pass and every repair pass after it.
+  let bail = null;
 
-  while (hasMore) {
-    // Checked before each page rather than after the walk: a report that runs
-    // to two hundred pages must stop within one fetch of being told to.
-    if (nosposAbort.isAborted(appTabId)) {
-      return { ok: false, aborted: true, error: `Stopped — ${nosposAbort.reasonFor(appTabId) || 'the page that started this went away'}.`, rows, tabId };
+  /**
+   * One pass over every page of the report, adding only rows not already read.
+   *
+   * A repair pass differs in one way: it expects most of what it sees to be
+   * familiar, so the "nothing new on this page" loop detector is off. Leaving it
+   * on would abort the repair after three pages every single time, since the
+   * rows it is walking past are exactly the ones the first pass already banked.
+   */
+  const walkOnce = async ({ repair = false } = {}) => {
+    let hasMore = true;
+    let page = 0;
+    let stalePages = 0;
+    while (hasMore) {
+      // Checked before each page rather than after the walk: a report that runs
+      // to two hundred pages must stop within one fetch of being told to.
+      if (nosposAbort.isAborted(appTabId)) {
+        bail = { ok: false, aborted: true, error: `Stopped — ${nosposAbort.reasonFor(appTabId) || 'the page that started this went away'}.`, rows, tabId };
+        return;
+      }
+      page += 1;
+      pages += 1;
+      const url = nosposPaymentReportUrl(page, fromDate, toDate);
+      if (page > NOSPOS_PAYMENT_REPORT_MAX_PAGES) {
+        bail = {
+          ok: false,
+          error: `Aborted after ${NOSPOS_PAYMENT_REPORT_MAX_PAGES} pages — far past any real report.`,
+          rows,
+          tabId,
+        };
+        return;
+      }
+
+      const r = await nosposCredentialedHtmlFetch(url);
+      if (r.loginRequired) { bail = { ok: false, loginRequired: true, tabId }; return; }
+      if (!r.ok) { bail = { ok: false, error: r.error, rows, pages: pages - 1, tabId }; return; }
+
+      reportedTotal = Math.max(reportedTotal, parseNosposGridTotal(r.html));
+      const pageRows = parseNosposPaymentReportRows(r.html);
+      // The report is live: a payment taken mid-walk shifts every later row,
+      // which would otherwise re-read the same payment on the next page. Key
+      // off the row id.
+      const fresh = pageRows.filter((row) => row.key && !seen.has(row.key));
+      fresh.forEach((row) => seen.add(row.key));
+      rows.push(...fresh);
+
+      // What a pagination loop actually looks like: pages keep arriving, and not
+      // one row on them is new. Counting pages could not tell that apart from a
+      // genuinely long report, which is why a big window used to be refused.
+      if (!repair && pageRows.length > 0 && fresh.length === 0) {
+        stalePages += 1;
+        if (stalePages >= NOSPOS_PAYMENT_REPORT_MAX_STALE_PAGES) {
+          bail = {
+            ok: false,
+            error: `Stopped at page ${page} — the report kept returning rows already read, so its pagination is looping.`,
+            rows,
+            pages,
+            tabId,
+          };
+          return;
+        }
+      } else {
+        stalePages = 0;
+      }
+
+      // Only used as a yes/no — the URL itself is ours (see nosposPaymentReportUrl).
+      // A page that came back with no rows also ends the walk, so a filter that
+      // matches nothing can't spin on a stale "next" link.
+      hasMore = Boolean(parseNosposPaginationNextHref(r.html, r.finalUrl)) && pageRows.length > 0;
+      // A repair pass exists only to close a shortfall. Once the count is made
+      // there is nothing left to find, so it stops rather than reading out the
+      // rest of the report for the sake of it.
+      if (repair && reportedTotal && rows.length >= reportedTotal) hasMore = false;
+      emitProgress({ page: pages, rows: fresh, total: rows.length, hasMore });
     }
-    page += 1;
-    const url = nosposPaymentReportUrl(page, fromDate, toDate);
-    if (page > NOSPOS_PAYMENT_REPORT_MAX_PAGES) {
-      return {
-        ok: false,
-        error: `Aborted after ${NOSPOS_PAYMENT_REPORT_MAX_PAGES} pages — pagination loop suspected.`,
-        rows,
-        tabId,
-      };
-    }
+  };
 
-    const r = await nosposCredentialedHtmlFetch(url);
-    if (r.loginRequired) return { ok: false, loginRequired: true, tabId };
-    if (!r.ok) return { ok: false, error: r.error, rows, pages: page - 1, tabId };
+  await walkOnce();
+  if (bail) return bail;
 
-    const pageRows = parseNosposPaymentReportRows(r.html);
-    // The report is ordered newest-first and live: a payment taken mid-walk
-    // shifts every later row one page down, which would otherwise re-read the
-    // same payment on the next page. Key off the row id.
-    const fresh = pageRows.filter((row) => row.key && !seen.has(row.key));
-    fresh.forEach((row) => seen.add(row.key));
-    rows.push(...fresh);
-
-    // Only used as a yes/no — the URL itself is ours (see nosposPaymentReportUrl).
-    // A page that came back with no rows also ends the walk, so a filter that
-    // matches nothing can't spin on a stale "next" link.
-    hasMore = Boolean(parseNosposPaginationNextHref(r.html, r.finalUrl)) && pageRows.length > 0;
-    emitProgress({ page, rows: fresh, total: rows.length, hasMore });
+  // ── Did we actually read the whole report? ──────────────────────────────
+  //
+  // Finishing without an error does not answer that, and neither does the page
+  // count: a row skipped because the report reordered itself between two fetches
+  // raises nothing anywhere. The grid's own summary is the only independent
+  // count there is, so it is compared, and a shortfall is walked again against
+  // the same seen-set until it closes.
+  //
+  // Missing rows are not a cosmetic problem. Three of them — £558 of sales and
+  // £60 of refunds — were the entire disagreement between the 27 Jul - 27 Aug
+  // stage and NosPos's trading report for the same window, and nothing in the
+  // capture said a word about it.
+  let repairs = 0;
+  while (reportedTotal && rows.length < reportedTotal
+         && repairs < NOSPOS_PAYMENT_REPORT_MAX_REPAIR_PASSES) {
+    repairs += 1;
+    console.warn('[CG Suite] payment report short, re-reading', {
+      have: rows.length, expected: reportedTotal, pass: repairs,
+    });
+    // eslint-disable-next-line no-await-in-loop
+    await walkOnce({ repair: true });
+    if (bail) return bail;
   }
 
-  console.log('[CG Suite] payment report scraped', { pages: page, rows: rows.length, fromDate, toDate });
-  return { ok: true, rows, pages: page, tabId, fromDate, toDate };
+  // Still short. The capture is NOT ok — a window missing payments produces a
+  // trading report that disagrees with NosPos for a reason no one can see from
+  // the figures, and half a window silently accepted is worse than a window
+  // that says it failed. The rows we did get travel with the failure so the
+  // caller can still show them.
+  if (reportedTotal && rows.length < reportedTotal) {
+    return {
+      ok: false,
+      error: `Read ${rows.length} of the ${reportedTotal} payments NosPos lists for `
+        + `${fromDate} to ${toDate} — ${reportedTotal - rows.length} row(s) could not be `
+        + 'reached after ' + repairs + ' further pass(es). Try the capture again.',
+      rows,
+      pages,
+      expected: reportedTotal,
+      missing: reportedTotal - rows.length,
+      tabId,
+      fromDate,
+      toDate,
+    };
+  }
+
+  console.log('[CG Suite] payment report scraped', {
+    pages, rows: rows.length, expected: reportedTotal, repairs, fromDate, toDate,
+  });
+  // `expected` travels even on success so the migration screen can say what it
+  // checked against, and 0 honestly means "the report did not tell us".
+  return { ok: true, rows, pages, expected: reportedTotal, repairs, tabId, fromDate, toDate };
 }

@@ -20,6 +20,7 @@ const BRIDGE_ACTIONS = {
   cancelRequest: handleBridgeAction_cancelRequest,
   searchNosposBarcode: handleBridgeAction_searchNosposBarcode,
   scrapeNosposStockEditForUpload: handleBridgeAction_scrapeNosposStockEditForUpload,
+  scrapeNosposStockMovements: handleBridgeAction_scrapeNosposStockMovements,
   scrapeNosposListedStockPage: handleBridgeAction_scrapeNosposListedStockPage,
   scrapeNosposPaymentReport: handleBridgeAction_scrapeNosposPaymentReport,
   scrapeNosposAgreements: handleBridgeAction_scrapeNosposAgreements,

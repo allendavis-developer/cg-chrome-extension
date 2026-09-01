@@ -99,6 +99,7 @@ importScripts(
   'flows/bridge/actions/resolve-nospos-park-agreement-line.js',
   'flows/bridge/actions/scrape-cex-super-categories.js',
   'flows/bridge/actions/scrape-nospos-stock-edit-for-upload.js',
+  'flows/bridge/actions/scrape-nospos-stock-movements.js',
   'flows/bridge/actions/scrape-nospos-listed-stock-page.js',
   'flows/bridge/actions/scrape-nospos-payment-report.js',
   'flows/bridge/actions/scrape-nospos-agreements.js',

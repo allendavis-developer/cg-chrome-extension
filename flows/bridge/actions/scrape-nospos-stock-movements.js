@@ -54,11 +54,77 @@ function parseNosposStockMovementsPage(html, requestedBarserial) {
       faulty_quantity: details['Faulty Quantity'] || '',
     },
     movements,
+    valid: Boolean(details.Barserial && /<h4[^>]*class="[^"]*card-title[^"]*"[^>]*>\s*Movements\s*<\/h4>/i.test(html || '')),
   };
 }
 
+function nosposStockMovementFetchWithTimeout(url, timeoutMs) {
+  return Promise.race([
+    nosposCredentialedHtmlFetch(url),
+    new Promise((resolve) => setTimeout(
+      () => resolve({ ok: false, error: `NosPos did not answer within ${Math.round(timeoutMs / 1000)} seconds` }),
+      timeoutMs,
+    )),
+  ]);
+}
+
+async function scrapeOneNosposStockMovementTarget(target) {
+  const requested = String(target.barserial || '').trim();
+  const firstUrl = `https://nospos.com/reports/stock/movements?barserial=${encodeURIComponent(requested)}`;
+  let lastError = 'NosPos returned an unreadable stock movements page.';
+
+  // The shared fetch helper already retries throttles/network errors five times.
+  // This extra page-level retry covers a successful HTTP response containing a
+  // half-rendered/error grid — something NosPos does under load with status 200.
+  for (let pageAttempt = 0; pageAttempt < 2; pageAttempt += 1) {
+    let url = firstUrl;
+    const pagesSeen = new Set();
+    let combined = null;
+    let failed = null;
+    for (let page = 0; page < 20 && url; page += 1) {
+      if (pagesSeen.has(url)) { failed = 'NosPos pagination looped back to an earlier page.'; break; }
+      pagesSeen.add(url);
+      const response = await nosposStockMovementFetchWithTimeout(url, 45_000);
+      if (!response.ok) return { target, url, response };
+      const parsed = parseNosposStockMovementsPage(response.html, requested);
+      if (!parsed.valid || parsed.barserial.toLowerCase() !== requested.toLowerCase()) {
+        failed = parsed.barserial
+          ? `NosPos returned barserial ${parsed.barserial} while ${requested} was requested.`
+          : 'NosPos returned a page without the Stock and Movements sections.';
+        break;
+      }
+      if (!combined) combined = { ...parsed, movements: [] };
+      combined.movements.push(...parsed.movements);
+      const next = parseNosposPaginationNextHref(response.html, response.finalUrl || url);
+      if (next && !next.includes('/reports/stock/movements')) {
+        failed = 'NosPos pagination pointed outside the stock movements report.';
+        break;
+      }
+      url = next;
+    }
+    if (url && !failed) failed = 'NosPos stock movement history exceeded the 20-page safety limit.';
+    if (!failed && combined) {
+      const unique = new Map();
+      combined.movements.forEach((movement) => {
+        const key = `${movement.row_key}|${movement.date}|${movement.summary}`;
+        if (!unique.has(key)) unique.set(key, movement);
+      });
+      combined.movements = [...unique.values()];
+      return { target, url: firstUrl, response: { ok: true }, parsed: combined, pages: pagesSeen.size };
+    }
+    lastError = failed || lastError;
+    await nosposHtmlFetchSleep(600 + Math.floor(Math.random() * 300));
+  }
+  return { target, url: firstUrl, response: { ok: false, error: lastError } };
+}
+
 async function handleBridgeAction_scrapeNosposStockMovements({ requestId, appTabId, pageInstanceId, payload }) {
-  const targets = Array.isArray(payload?.targets) ? payload.targets.filter((target) => target?.barserial) : [];
+  const deduplicated = new Map();
+  (Array.isArray(payload?.targets) ? payload.targets : []).forEach((target) => {
+    const key = String(target?.barserial || '').trim().toLowerCase();
+    if (key && !deduplicated.has(key)) deduplicated.set(key, target);
+  });
+  const targets = [...deduplicated.values()];
   if (!targets.length) return { ok: false, error: 'No barserials were supplied.' };
   if (targets.length > 100) return { ok: false, error: 'A maximum of 100 barserials may be read at once.' };
 
@@ -69,23 +135,23 @@ async function handleBridgeAction_scrapeNosposStockMovements({ requestId, appTab
   let loginRequired = false;
   const failures = [];
   const results = [];
-  const fetched = await nosposFetchPool(targets, async (target) => {
-    const url = `https://nospos.com/reports/stock/movements?barserial=${encodeURIComponent(target.barserial)}`;
-    return { target, url, response: await nosposCredentialedHtmlFetch(url) };
-  }, {
+  let completedFailures = 0;
+  const fetched = await nosposFetchPool(targets, scrapeOneNosposStockMovementTarget, {
     shouldStop: () => loginRequired || nosposAbort.isAborted(appTabId),
     onProgress: (done, total, entry) => {
       if (entry?.ok && entry.value?.response?.loginRequired) loginRequired = true;
-      emit({ done, total, failures: failures.length });
+      if (!entry?.ok || (entry.value?.response && !entry.value.response.ok)) completedFailures += 1;
+      emit({ done, total, failures: completedFailures, concurrency: nosposFetchGovernor.current() });
     },
   });
 
   if (loginRequired) return { ok: false, loginRequired: true, results };
-  fetched.forEach((entry) => {
-    if (!entry?.ok) { failures.push({ barserial: '', error: entry?.error || 'Fetch failed' }); return; }
+  fetched.forEach((entry, index) => {
+    const expected = targets[index];
+    if (!entry?.ok) { failures.push({ barserial: expected?.barserial || '', error: entry?.error || 'Fetch failed' }); return; }
     const { target, url, response } = entry.value;
     if (!response.ok) { failures.push({ barserial: target.barserial, url, error: response.error || 'Fetch failed' }); return; }
-    results.push({ ...parseNosposStockMovementsPage(response.html, target.barserial), url });
+    results.push({ ...entry.value.parsed, url, pages: entry.value.pages });
   });
-  return { ok: true, results, failures };
+  return { ok: true, requested: targets.length, completed: results.length + failures.length, results, failures };
 }

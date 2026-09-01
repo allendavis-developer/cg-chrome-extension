@@ -12,6 +12,7 @@ vm.createContext(sandbox);
 vm.runInContext(source, sandbox);
 
 const html = `
+<h4 class="card-title">Movements</h4>
 <div class="detail"><strong>Barserial</strong><span>BBWY8I7GMMHPY</span></div>
 <div class="detail"><strong>Name</strong><span>iphone 16e 128gb</span></div>
 <div class="detail"><strong>Quantity 28</strong><span>1</span></div>
@@ -30,5 +31,9 @@ if (parsed.movements[0].operator !== 'Jen') throw new Error('operator was not pa
 if (parsed.movements[1].event_type !== 'MOVED_TO_FREE') throw new Error('move classification lost');
 if (parsed.movements[2].price !== '87.50') throw new Error('price was not parsed');
 if (parsed.movements[2].agreement_id !== '109614') throw new Error('agreement link was not parsed');
+if (!parsed.valid) throw new Error('a complete movements page was rejected');
+
+const incomplete = sandbox.parseNosposStockMovementsPage('<div>temporary NosPos error</div>', 'BBWY8I7GMMHPY');
+if (incomplete.valid) throw new Error('an error page was accepted as an empty movement history');
 
 console.log('PASS nospos-stock-movements');

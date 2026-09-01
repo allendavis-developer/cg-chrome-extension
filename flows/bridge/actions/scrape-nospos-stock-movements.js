@@ -121,8 +121,9 @@ async function scrapeOneNosposStockMovementTarget(target) {
 async function handleBridgeAction_scrapeNosposStockMovements({ requestId, appTabId, pageInstanceId, payload }) {
   const deduplicated = new Map();
   (Array.isArray(payload?.targets) ? payload.targets : []).forEach((target) => {
-    const key = String(target?.barserial || '').trim().toLowerCase();
-    if (key && !deduplicated.has(key)) deduplicated.set(key, target);
+    const barserial = String(target?.barserial || target?.barcode || '').trim();
+    const key = barserial.toLowerCase();
+    if (key && !deduplicated.has(key)) deduplicated.set(key, { ...target, barserial });
   });
   const targets = [...deduplicated.values()];
   if (!targets.length) return { ok: false, error: 'No barserials were supplied.' };

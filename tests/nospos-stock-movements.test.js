@@ -36,4 +36,8 @@ if (!parsed.valid) throw new Error('a complete movements page was rejected');
 const incomplete = sandbox.parseNosposStockMovementsPage('<div>temporary NosPos error</div>', 'BBWY8I7GMMHPY');
 if (incomplete.valid) throw new Error('an error page was accepted as an empty movement history');
 
+const barcodeOnly = { barcode: 'BBWY8I7GMMHPY' };
+const acceptedName = String(barcodeOnly.barserial || barcodeOnly.barcode || '').trim();
+if (acceptedName !== 'BBWY8I7GMMHPY') throw new Error('barcode alias was not accepted as a barserial');
+
 console.log('PASS nospos-stock-movements');

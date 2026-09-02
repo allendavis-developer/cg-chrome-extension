@@ -40,4 +40,23 @@ const barcodeOnly = { barcode: 'BBWY8I7GMMHPY' };
 const acceptedName = String(barcodeOnly.barserial || barcodeOnly.barcode || '').trim();
 if (acceptedName !== 'BBWY8I7GMMHPY') throw new Error('barcode alias was not accepted as a barserial');
 
+// One barserial NosPos refuses is that barserial's problem; only a redirect
+// away from the report means the session is gone. Reading the first as the
+// second ended a ten-thousand barserial run on its first refused page and threw
+// away everything the batch had already read.
+const refusedOnePage = sandbox.nosposStockMovementSessionLost({
+  loginRequired: true, status: 403,
+  finalUrl: 'https://nospos.com/reports/stock/movements?barserial=BB1',
+});
+if (refusedOnePage) throw new Error('a single refused barserial was read as a lost session');
+
+const redirectedToLogin = sandbox.nosposStockMovementSessionLost({
+  loginRequired: true, status: 200, finalUrl: 'https://nospos.com/site/standard-login',
+});
+if (!redirectedToLogin) throw new Error('a login redirect was not read as a lost session');
+
+if (sandbox.nosposStockMovementSessionLost({ ok: false, error: 'timeout' })) {
+  throw new Error('an ordinary failure was read as a lost session');
+}
+
 console.log('PASS nospos-stock-movements');

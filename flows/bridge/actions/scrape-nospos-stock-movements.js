@@ -68,6 +68,22 @@ function nosposStockMovementFetchWithTimeout(url, timeoutMs) {
   ]);
 }
 
+/**
+ * Did this response mean the SESSION is gone, or just that this one page is?
+ *
+ * `nosposCredentialedHtmlFetch` reports 401/403 and a login redirect alike as
+ * `loginRequired`, which is right for a single page read on demand and wrong
+ * for a walk: one barserial NosPos refuses (deleted stock, another shop's item)
+ * would otherwise be read as "you are logged out" and end a run of ten thousand.
+ * Only a redirect away from the report is a lost session.
+ */
+function nosposStockMovementSessionLost(response) {
+  if (!response || !response.loginRequired) return false;
+  const finalUrl = String(response.finalUrl || '').toLowerCase();
+  if (!finalUrl) return true;
+  return !finalUrl.includes('/reports/stock/movements');
+}
+
 async function scrapeOneNosposStockMovementTarget(target) {
   const requested = String(target.barserial || '').trim();
   const firstUrl = `https://nospos.com/reports/stock/movements?barserial=${encodeURIComponent(requested)}`;
@@ -133,26 +149,57 @@ async function handleBridgeAction_scrapeNosposStockMovements({ requestId, appTab
     appTabId, { type: 'EXTENSION_PROGRESS_TO_PAGE', requestId, payload: progress },
   ).catch(() => {});
   nosposAbort.begin(appTabId, pageInstanceId);
-  let loginRequired = false;
+  // A walk that a previous capture's throttling knocked down to one in flight
+  // stays there: the governor only climbs a slot per twenty clean pages, so a
+  // ten-thousand barserial run inherits a crawl it did nothing to earn. This
+  // step is the operator's whole action, so it starts from a clean ceiling.
+  nosposFetchGovernor.reset();
+  let sessionLost = false;
   const failures = [];
   const results = [];
   let completedFailures = 0;
   const fetched = await nosposFetchPool(targets, scrapeOneNosposStockMovementTarget, {
-    shouldStop: () => loginRequired || nosposAbort.isAborted(appTabId),
+    shouldStop: () => sessionLost || nosposAbort.isAborted(appTabId),
     onProgress: (done, total, entry) => {
-      if (entry?.ok && entry.value?.response?.loginRequired) loginRequired = true;
+      if (entry?.ok && nosposStockMovementSessionLost(entry.value?.response)) sessionLost = true;
       if (!entry?.ok || (entry.value?.response && !entry.value.response.ok)) completedFailures += 1;
       emit({ done, total, failures: completedFailures, concurrency: nosposFetchGovernor.current() });
     },
   });
 
-  if (loginRequired) return { ok: false, loginRequired: true, results };
   fetched.forEach((entry, index) => {
     const expected = targets[index];
+    // A slot the pool never got to (the walk stopped, or the tab went away)
+    // has no entry at all. It is not a failure to report against a barserial —
+    // it simply was not attempted, and the next run picks it up.
+    if (entry === undefined) return;
     if (!entry?.ok) { failures.push({ barserial: expected?.barserial || '', error: entry?.error || 'Fetch failed' }); return; }
     const { target, url, response } = entry.value;
-    if (!response.ok) { failures.push({ barserial: target.barserial, url, error: response.error || 'Fetch failed' }); return; }
+    if (!response.ok) {
+      failures.push({
+        barserial: target.barserial,
+        url,
+        error: response.error
+          || (response.loginRequired
+            ? `NosPos refused this page (HTTP ${response.status || '403'})`
+            : 'Fetch failed'),
+      });
+      return;
+    }
     results.push({ ...entry.value.parsed, url, pages: entry.value.pages });
   });
-  return { ok: true, requested: targets.length, completed: results.length + failures.length, results, failures };
+
+  // Everything that WAS read comes back, whatever ended the walk. Returning
+  // only the verdict threw away every page already fetched, so a single refused
+  // barserial cost the whole batch and the run could never save a row.
+  return {
+    ok: true,
+    requested: targets.length,
+    completed: results.length + failures.length,
+    attempted: fetched.filter((entry) => entry !== undefined).length,
+    results,
+    failures,
+    loginRequired: sessionLost,
+    stopped: nosposAbort.isAborted(appTabId) ? (nosposAbort.reasonFor(appTabId) || 'stopped') : '',
+  };
 }

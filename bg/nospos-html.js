@@ -94,7 +94,10 @@ async function nosposCredentialedHtmlFetch(url) {
 
     var finalUrl = response.url || url;
     if (nosposHtmlFetchIndicatesNotLoggedIn(response, finalUrl)) {
-      return { ok: false, loginRequired: true };
+      // Status and final URL come back too: a redirect to /login is a lost
+      // session, while a bare 403 on one page is that page's problem. Only the
+      // caller knows which of those should end its walk.
+      return { ok: false, loginRequired: true, status: response.status, finalUrl: finalUrl };
     }
 
     if (response.status === 429 || response.status >= 500) {
